@@ -144,7 +144,7 @@ def resolve_countries(requested, available):
         if not match:
             close = difflib.get_close_matches(name.lower(), list(by_lower), n=3, cutoff=0.6)
             hint = f" Did you mean: {', '.join(by_lower[c] for c in close)}?" if close else ""
-            raise GluetailError(f"'{name}' is not available.{hint} Run `gluetail countries <node>`.")
+            raise GluetailError(f"'{name}' is not available.{hint} Run `gluetail options <node>` to see what is available.")
         out.append(match)
     return out
 
@@ -302,6 +302,134 @@ def cmd_render(args):
     return 0
 
 
+# --- provider schema: generated from gluetun's own server list ---------------
+# Server attribute -> (API key, env var, label). Everything else is derived:
+# an attribute whose values are all True becomes a toggle "<attr>_only"/"<ATTR>_ONLY".
+SERVER_FIELDS = {
+    "country": ("countries", "SERVER_COUNTRIES", "Country"),
+    "region": ("regions", "SERVER_REGIONS", "Region"),
+    "city": ("cities", "SERVER_CITIES", "City"),
+    "isp": ("isps", "ISP", "ISP"),
+}
+FLAG_NAME_EXCEPTIONS = {"multihop": "multi_hop"}
+NON_FILTER_FIELDS = {"vpn", "ips", "tcp", "udp", "wgpubkey", "hostname", "server_name", "number", "port",
+                     "categories", "port_forward_ports"}
+PLAN_FIELD = "free"
+TRUTHY = ("on", "yes", "true", "1")
+
+
+def build_facets(servers):
+    """Derive filter controls from a provider's server list. Returns (facets, unsupported)."""
+    seen = {}
+    for srv in servers:
+        for field, value in srv.items():
+            seen.setdefault(field, []).append(value)
+    facets = [
+        {"field": f, "key": k, "env": e, "label": lbl, "kind": "multi"}
+        for f, (k, e, lbl) in SERVER_FIELDS.items() if f in seen
+    ]
+    unsupported = []
+    for field in sorted(seen):
+        if field in SERVER_FIELDS or field in NON_FILTER_FIELDS:
+            continue
+        if all(v is True for v in seen[field]):
+            name = FLAG_NAME_EXCEPTIONS.get(field, field)
+            facets.append({"field": field, "key": f"{name}_only", "env": f"{name.upper()}_ONLY",
+                           "label": field.replace("_", " ").capitalize(),
+                           "kind": "plan" if field == PLAN_FIELD else "bool"})
+        else:
+            unsupported.append(field)
+    return facets, unsupported
+
+
+def server_matches(server, selection, facets, skip=None):
+    for f in facets:
+        if f["key"] == skip or f["kind"] == "plan":
+            continue
+        want = selection.get(f["key"])
+        if not want:
+            continue
+        if f["kind"] == "multi":
+            if str(server.get(f["field"], "")).lower() not in {v.lower() for v in want}:
+                return False
+        elif not server.get(f["field"]):
+            return False
+    return True
+
+
+def compute_options(servers, facets, unsupported, selection, free_plan):
+    """Faceted view of what can still be chosen, given the current selection and plan."""
+    base = [s for s in servers if s.get(PLAN_FIELD) or not free_plan]
+    out = []
+    for f in facets:
+        if f["kind"] == "plan":
+            continue
+        others = [s for s in base if server_matches(s, selection, facets, skip=f["key"])]
+        entry = {"key": f["key"], "env": f["env"], "label": f["label"], "kind": f["kind"],
+                 "selected": selection.get(f["key"]) or ([] if f["kind"] == "multi" else False)}
+        if f["kind"] == "multi":
+            counts = {}
+            for s in others:
+                if f["field"] in s:
+                    counts[s[f["field"]]] = counts.get(s[f["field"]], 0) + 1
+            entry["options"] = [{"value": v, "count": c} for v, c in sorted(counts.items())]
+        else:
+            entry["count"] = sum(1 for s in others if s.get(f["field"]))
+            if not entry["count"]:
+                entry["disabled_reason"] = "no servers on your plan" if free_plan else "no matching servers"
+        out.append(entry)
+    match_count = sum(1 for s in base if server_matches(s, selection, facets))
+    return {"plan": "free" if free_plan else "all", "match_count": match_count, "facets": out,
+            "unsupported": unsupported}
+
+
+def selection_from_env(env, facets):
+    sel = {}
+    for f in facets:
+        raw = env.get(f["env"], "")
+        if f["kind"] == "multi":
+            sel[f["key"]] = [v.strip() for v in raw.split(",") if v.strip()]
+        elif f["kind"] == "bool":
+            sel[f["key"]] = raw.strip().lower() in TRUTHY
+    return sel
+
+
+def parse_changes(items, facets, options):
+    """Turn ['countries=Japan', 'secure_core_only=on', 'cities='] into {key: list|bool}."""
+    by_key = {f["key"]: f for f in facets if f["kind"] != "plan"}
+    by_field = {f["field"]: f for f in by_key.values()}
+    avail = {e["key"]: [o["value"] for o in e.get("options", [])] for e in options["facets"]}
+    changes = {}
+    for item in items:
+        key, sep, value = item.partition("=")
+        key = key.strip().lower()
+        f = by_key.get(key) or by_field.get(key)
+        if not sep or not f:
+            known = ", ".join(sorted(by_key))
+            raise GluetailError(f"bad filter '{item}': use key=value with key one of: {known}")
+        if f["kind"] == "bool":
+            if value.strip().lower() not in TRUTHY + ("off", "no", "false", "0", ""):
+                raise GluetailError(f"{f['key']} must be on or off")
+            changes[f["key"]] = value.strip().lower() in TRUTHY
+        else:
+            names = [v.strip() for v in value.split(",") if v.strip()]
+            changes[f["key"]] = resolve_countries(names, avail.get(f["key"], [])) if names else []
+    return changes
+
+
+def describe_failure(options, changes):
+    lines = []
+    for e in options["facets"]:
+        if e["key"] not in changes:
+            continue
+        if e["kind"] == "multi":
+            opts = ", ".join(f"{o['value']}" for o in e["options"][:12]) or "none"
+            lines.append(f"{e['label']} options with the other filters applied: {opts}")
+        elif changes[e["key"]] and e.get("disabled_reason"):
+            lines.append(f"{e['key']}: {e['disabled_reason']}")
+    return "; ".join(lines)
+
+
 def update_env_file(path, key, value):
     if any(c in value for c in "\r\n\0"):
         raise GluetailError("refusing to write a value containing control characters")
@@ -320,33 +448,82 @@ def update_env_file(path, key, value):
         f.write("\n".join(lines) + "\n")
 
 
-def set_country(node, requested, persist=True, timeout=90):
-    countries = resolve_countries(requested, node_countries(node))
-    api(node, "PUT", "/v1/vpn/settings",
-        {"provider": {"server_selection": {"countries": [c.lower() for c in countries]}}})
-    wanted = {c.lower() for c in countries}
+def load_servers(node):
+    if not node.servers_json or not os.path.exists(node.servers_json):
+        raise GluetailError(f"{node.name}: gluetun server list not found (has the node started once?)")
+    with open(node.servers_json) as f:
+        doc = json.load(f)
+    if node.provider not in doc:
+        raise GluetailError(f"provider '{node.provider}' not found in gluetun's server list")
+    return [s for s in doc[node.provider]["servers"] if s.get("vpn", "wireguard") == "wireguard"]
+
+
+def node_file(node):
+    if not node.working_dir:
+        raise GluetailError(f"{node.name}: cannot find the compose directory")
+    return os.path.join(node.working_dir, "nodes", f"{node.name}.env")
+
+
+def node_view(node):
+    """Everything the options/set logic needs, from the server list and the saved node file."""
+    servers = load_servers(node)
+    facets, unsupported = build_facets(servers)
+    with open(node_file(node)) as f:
+        env = parse_env_text(f.read())
+    free_plan = env.get("FREE_ONLY", "").strip().lower() in TRUTHY
+    return servers, facets, unsupported, selection_from_env(env, facets), free_plan
+
+
+def get_options(node):
+    servers, facets, unsupported, selection, free_plan = node_view(node)
+    return compute_options(servers, facets, unsupported, selection, free_plan)
+
+
+def _put_selection(node, values):
+    return api(node, "PUT", "/v1/vpn/settings", {"provider": {"server_selection": values}})
+
+
+def _wait_running(node, timeout):
+    """Wait until the VPN is up and has a public IP; return the IP info or None."""
     deadline = time.time() + timeout
-    seen = None
     while time.time() < deadline:
         time.sleep(2)
         try:
             if api(node, "GET", "/v1/vpn/status")["status"] == "running":
                 ip = api(node, "GET", "/v1/publicip/ip")
-                seen = ip
-                if (ip.get("country") or "").lower() in wanted:
-                    break
+                if ip.get("public_ip"):
+                    return ip
         except GluetailError:
             pass  # control API can blink while the VPN restarts
-    else:
-        raise GluetailError(f"{node.name}: VPN did not come back in {timeout}s in {', '.join(countries)}"
-                            + (f" (last seen: {seen.get('country')})" if seen else ""))
+    return None
+
+
+def set_filters(node, items, persist=True, timeout=90):
+    servers, facets, unsupported, selection, free_plan = node_view(node)
+    # names are validated against everything the plan offers; the combination is checked below
+    changes = parse_changes(items, facets, compute_options(servers, facets, unsupported, {}, free_plan))
+    new_sel = {**selection, **changes}
+    after = compute_options(servers, facets, unsupported, new_sel, free_plan)
+    if not after["match_count"]:
+        raise GluetailError(f"no {after['plan']}-plan server matches that combination. "
+                            + describe_failure(after, changes))
+    result = _put_selection(node, changes)
+    if result == "settings left unchanged":
+        return {"node": node.name, "unchanged": True, "selection": new_sel}
+    ip = None if result == "crashed" else _wait_running(node, timeout)
+    if ip is None:
+        _put_selection(node, {k: selection[k] for k in changes})  # roll back to the saved selection
+        back = _wait_running(node, timeout)
+        raise GluetailError(f"{node.name}: the VPN did not come up with those filters; "
+                            + ("rolled back to the previous selection" if back else
+                               "rollback also pending (gluetun retries with growing delays), check `gluetail status`"))
     if persist:
-        if not node.working_dir:
-            raise GluetailError("applied, but cannot find the compose directory to save the choice")
-        update_env_file(os.path.join(node.working_dir, "nodes", f"{node.name}.env"),
-                        "SERVER_COUNTRIES", ",".join(countries))
-    return {"node": node.name, "countries": countries, "public_ip": seen.get("public_ip"),
-            "country": seen.get("country"), "city": seen.get("city"), "persisted": persist}
+        by_key = {f["key"]: f for f in facets}
+        for key, value in changes.items():
+            text = ",".join(value) if isinstance(value, list) else ("on" if value else "")
+            update_env_file(node_file(node), by_key[key]["env"], text)
+    return {"node": node.name, "unchanged": False, "selection": new_sel, "public_ip": ip.get("public_ip"),
+            "country": ip.get("country"), "city": ip.get("city"), "persisted": persist}
 
 
 def cmd_status(args):
@@ -372,13 +549,48 @@ def cmd_countries(args):
     return 0
 
 
-def cmd_set_country(args):
-    res = set_country(node_from_args(args), args.country, persist=not args.no_persist, timeout=args.timeout)
+def _print_set_result(res, args):
     if args.json:
         print(json.dumps(res, indent=2))
+    elif res["unchanged"]:
+        print(f"{res['node']}: already set that way, nothing changed")
     else:
         note = f"saved to nodes/{res['node']}.env" if res["persisted"] else "not saved (reverts on recreate)"
         print(f"{res['node']}: now exiting via {res['city']}, {res['country']} ({res['public_ip']}); {note}")
+
+
+def cmd_set(args):
+    _print_set_result(set_filters(node_from_args(args), args.filters, persist=not args.no_persist,
+                                  timeout=args.timeout), args)
+    return 0
+
+
+def cmd_set_country(args):
+    _print_set_result(set_filters(node_from_args(args), ["countries=" + ",".join(args.country)],
+                                  persist=not args.no_persist, timeout=args.timeout), args)
+    return 0
+
+
+def cmd_options(args):
+    node = node_from_args(args)
+    opts = get_options(node)
+    if args.json:
+        print(json.dumps(opts, indent=2))
+        return 0
+    print(f"{node.name} ({node.provider}, {opts['plan']} plan): {opts['match_count']} matching servers")
+    for e in opts["facets"]:
+        if e["kind"] == "multi":
+            chosen = {v.lower() for v in e["selected"]}
+            items = " ".join(("*" if o["value"].lower() in chosen else "") + f"{o['value'].replace(' ', '_')}({o['count']})"
+                             for o in e["options"])
+            print(f"  {e['key']:<18} {items or '-'}")
+        else:
+            state = "on" if e["selected"] else "off"
+            why = f"  [{e['disabled_reason']}]" if e.get("disabled_reason") else f"  ({e['count']} servers)"
+            print(f"  {e['key']:<18} {state}{why}")
+    if opts["unsupported"]:
+        print(f"  (server attributes without a control yet: {', '.join(opts['unsupported'])})")
+    print("change with: gluetail set <node> key=value[,value] ...   (e.g. countries=Japan cities=Tokyo)")
     return 0
 
 
@@ -399,7 +611,20 @@ def main(argv=None):
     s.add_argument("node", nargs="?", help="node name or tailnet name (optional if there is one VPN node)")
     s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_countries)
-    s = sub.add_parser("set-country", help="change a node's exit country")
+    s = sub.add_parser("options", help="show the filters a node supports and what each can still be set to")
+    s.add_argument("node", nargs="?", help="node name or tailnet name (optional if there is one VPN node)")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_options)
+    s = sub.add_parser("set", help="change filters, e.g. set proton countries=Japan cities=Tokyo")
+    s.add_argument("node", help="node name or tailnet name")
+    s.add_argument("filters", nargs="+", metavar="key=value")
+    s.add_argument("--no-persist", action="store_true", help="do not save the choice to the node file")
+    s.add_argument("--timeout", type=int, default=90)
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_set)
+    s = sub.add_parser("set-country", help="shortcut for: set <node> countries=...")
     s.add_argument("node", help="node name or tailnet name, see `gluetail nodes`")
     s.add_argument("country", nargs="+")
     s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)

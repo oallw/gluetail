@@ -98,10 +98,21 @@ finds VPN nodes through the `gluetail.node` label (a node can be given by name o
 ```bash
 ./gluetail nodes                       # configured nodes, tailnet names, provider, countries
 ./gluetail status                      # state, exit IP and location per node
-./gluetail countries [proton]          # countries this node can use (free-only aware)
-./gluetail set-country proton Japan    # switch at runtime; saves SERVER_COUNTRIES to nodes/proton.env
-./gluetail set-country proton Norway Poland --no-persist   # try without saving
+./gluetail options [proton]            # filters this provider supports and what each can still be set to
+./gluetail set proton countries=Japan cities=Tokyo   # change filters live; saved to nodes/proton.env
+./gluetail set proton secure_core_only=on   # toggles; key= (empty) clears a filter
+./gluetail set-country proton Japan    # shortcut for countries=...
+./gluetail countries [proton]          # just the country list
+./gluetail set proton countries=Norway --no-persist   # try without saving
 ```
+
+`options` is generated from gluetun's own server list for the node's provider, so
+it follows gluetun updates and works for any provider. Which toggles exist depends
+on the provider (Proton: secure core, port forwarding; Mullvad: owned
+servers, ISP). With `FREE_ONLY=on` only free servers are offered and toggles with no
+free servers are marked unavailable. A combination no server matches is refused up
+front (otherwise gluetun tears the tunnel down and retries with growing delays), and
+if the VPN still fails to come up the previous selection is restored.
 
 The switch applies live (the VPN restarts in a few seconds; clients on that exit
 node reconnect). Saving to the node file means a `docker compose up -d --force-recreate`
