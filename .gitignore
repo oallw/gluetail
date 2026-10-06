@@ -1,0 +1,6 @@
+.env
+data/
+secrets/
+__pycache__/
+nodes/*.env
+docker-compose.yml

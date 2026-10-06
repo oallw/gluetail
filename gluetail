@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""gluetail: inspect and control gluetail exit nodes (stdlib only).
+
+Nodes are the gluetun containers labelled `gluetail.node=<name>`. The CLI talks
+to each one's control API directly over the `gluetail` Docker network, so it
+needs the Docker CLI but no Docker socket exposure and no published ports.
+"""
+import argparse
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Optional
+
+LABEL = "gluetail.node"
+NETWORK = "gluetail"
+API_PORT = 8000
+
+
+class GluetailError(Exception):
+    pass
+
+
+@dataclass
+class Node:
+    name: str
+    container: str
+    state: str
+    ip: Optional[str]
+    provider: str
+    free_only: bool
+    working_dir: Optional[str]
+    servers_json: Optional[str]
+
+
+def run_docker(*args):
+    try:
+        done = subprocess.run(["docker", *args], check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise GluetailError("docker CLI not found")
+    except subprocess.CalledProcessError as e:
+        raise GluetailError(f"docker {args[0]} failed: {e.stderr.strip()}")
+    return done.stdout
+
+
+def parse_node(inspect):
+    """Build a Node from `docker inspect` output, keeping only non-secret fields."""
+    cfg = inspect["Config"]
+    labels = cfg.get("Labels") or {}
+    env = {}
+    for item in cfg.get("Env") or []:
+        key, _, value = item.partition("=")
+        if key in ("VPN_SERVICE_PROVIDER", "FREE_ONLY"):
+            env[key] = value
+    net = (inspect["NetworkSettings"]["Networks"] or {}).get(NETWORK) or {}
+    data_dir = next((m["Source"] for m in inspect.get("Mounts", []) if m["Destination"] == "/gluetun"), None)
+    name = labels[LABEL]
+    return Node(
+        name=name,
+        container=inspect["Name"].lstrip("/"),
+        state=inspect["State"]["Status"],
+        ip=net.get("IPAddress") or None,
+        provider=env.get("VPN_SERVICE_PROVIDER", ""),
+        free_only=env.get("FREE_ONLY", "").lower() in ("on", "yes", "true", "1"),
+        working_dir=labels.get("com.docker.compose.project.working_dir"),
+        servers_json=os.path.join(data_dir, "servers.json") if data_dir else None,
+    )
+
+
+def discover_nodes():
+    ids = run_docker("ps", "-aq", "--filter", f"label={LABEL}").split()
+    if not ids:
+        return []
+    nodes = [parse_node(i) for i in json.loads(run_docker("inspect", *ids))]
+    return sorted(nodes, key=lambda n: n.name)
+
+
+def get_node(name):
+    nodes = discover_nodes()
+    for n in nodes:
+        if n.name == name:
+            return n
+    known = ", ".join(n.name for n in nodes) or "none found (is the stack up?)"
+    raise GluetailError(f"unknown node '{name}'; known nodes: {known}")
+
+
+def decode_body(raw):
+    """Control API replies are JSON, except settings updates which return plain text."""
+    text = raw.decode(errors="replace").strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def api(node, method, path, body=None, timeout=5):
+    if not node.ip:
+        raise GluetailError(f"{node.name}: container is not running on the '{NETWORK}' network")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"http://{node.ip}:{API_PORT}{path}", data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return decode_body(resp.read())
+    except urllib.error.HTTPError as e:
+        raise GluetailError(f"{node.name}: {method} {path} -> HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        raise GluetailError(f"{node.name}: control API unreachable ({e})")
+
+
+def node_status(node):
+    out = {"node": node.name, "container": node.state, "provider": node.provider}
+    try:
+        out["vpn"] = api(node, "GET", "/v1/vpn/status")["status"]
+        ip = api(node, "GET", "/v1/publicip/ip")
+        out.update(public_ip=ip.get("public_ip"), country=ip.get("country"), city=ip.get("city"))
+    except GluetailError as e:
+        out["error"] = str(e)
+    return out
+
+
+def list_countries(servers, provider, free_only):
+    if provider not in servers:
+        raise GluetailError(f"provider '{provider}' not found in gluetun's server list")
+    found = {
+        s["country"]
+        for s in servers[provider]["servers"]
+        if s.get("vpn") == "wireguard" and (s.get("free") or not free_only)
+    }
+    return sorted(found)
+
+
+def resolve_countries(requested, available):
+    by_lower = {c.lower(): c for c in available}
+    out = []
+    for name in requested:
+        match = by_lower.get(name.lower())
+        if not match:
+            close = difflib.get_close_matches(name.lower(), list(by_lower), n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(by_lower[c] for c in close)}?" if close else ""
+            raise GluetailError(f"'{name}' is not available.{hint} Run `gluetail countries <node>`.")
+        out.append(match)
+    return out
+
+
+def node_countries(node):
+    if not node.servers_json or not os.path.exists(node.servers_json):
+        raise GluetailError(f"{node.name}: gluetun server list not found (has the node started once?)")
+    with open(node.servers_json) as f:
+        return list_countries(json.load(f), node.provider, node.free_only)
+
+
+NODE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
+HOSTNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$")
+TS_ARGS_RE = re.compile(r"^[A-Za-z0-9=,:._ /-]*$")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def parse_env_text(text):
+    """Parse dotenv-style text into a dict (no interpolation, optional quotes)."""
+    out = {}
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise GluetailError(f"line {n}: expected KEY=VALUE, got '{raw}'")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def load_node_files(nodes_dir):
+    nodes = {}
+    for fname in sorted(os.listdir(nodes_dir)) if os.path.isdir(nodes_dir) else []:
+        if not fname.endswith(".env"):
+            continue
+        name = fname[:-4]
+        if not NODE_NAME_RE.match(name):
+            raise GluetailError(f"{fname}: node name must match {NODE_NAME_RE.pattern}")
+        with open(os.path.join(nodes_dir, fname)) as f:
+            try:
+                nodes[name] = parse_env_text(f.read())
+            except GluetailError as e:
+                raise GluetailError(f"{fname}: {e}")
+    return nodes
+
+
+def render_compose(nodes, template_dir):
+    """Render docker-compose.yml text from parsed node settings."""
+    def tpl(name):
+        with open(os.path.join(template_dir, name)) as f:
+            return f.read()
+
+    parts = [tpl("header.yml")]
+    if not nodes:
+        raise GluetailError("no nodes found: create nodes/<name>.env (see nodes/*.env.example)")
+    for name, cfg in nodes.items():
+        kind = cfg.get("GLUETAIL_TYPE", "vpn")
+        if kind not in ("vpn", "direct"):
+            raise GluetailError(f"{name}: GLUETAIL_TYPE must be 'vpn' or 'direct', got '{kind}'")
+        hostname = cfg.get("GLUETAIL_HOSTNAME", f"exit-{name}")
+        ts_args = cfg.get("GLUETAIL_TS_ARGS", "")
+        secrets = cfg.get("GLUETAIL_SECRETS", f"./secrets/{name}.env")
+        if not HOSTNAME_RE.match(hostname):
+            raise GluetailError(f"{name}: invalid GLUETAIL_HOSTNAME '{hostname}'")
+        if not TS_ARGS_RE.match(ts_args):
+            raise GluetailError(f"{name}: GLUETAIL_TS_ARGS contains unsupported characters")
+        for label, value in (("GLUETAIL_SECRETS", secrets), ("GLUETAIL_TS_ARGS", ts_args)):
+            if "$" in value or any(c in value for c in "\r\n\0"):
+                raise GluetailError(f"{name}: {label} must not contain '$' or control characters")
+        if kind == "vpn" and "VPN_SERVICE_PROVIDER" not in cfg:
+            raise GluetailError(f"{name}: VPN nodes need VPN_SERVICE_PROVIDER (e.g. protonvpn, mullvad)")
+        text = tpl(f"{kind}.yml")
+        for key, value in (("@@NAME@@", name), ("@@HOSTNAME@@", hostname), ("@@TS_ARGS@@", ts_args),
+                           ("@@SECRETS@@", json.dumps(secrets))):
+            text = text.replace(key, value)
+        parts.append(text)
+    return "".join(parts)
+
+
+def summarize_nodes(cfgs, container_states):
+    rows = []
+    for name, cfg in cfgs.items():
+        kind = cfg.get("GLUETAIL_TYPE", "vpn")
+        rows.append({
+            "node": name,
+            "type": kind,
+            "hostname": cfg.get("GLUETAIL_HOSTNAME", f"exit-{name}"),
+            "provider": cfg.get("VPN_SERVICE_PROVIDER", "-") if kind == "vpn" else "-",
+            "countries": (cfg.get("SERVER_COUNTRIES") or "any") if kind == "vpn" else "-",
+            "state": container_states.get(f"gluetail-ts-{name}", "not created"),
+        })
+    return rows
+
+
+def resolve_name(arg, cfgs):
+    """Accept a node name or its tailnet hostname (what the Tailscale app shows)."""
+    if arg in cfgs:
+        return arg
+    for name, cfg in cfgs.items():
+        if cfg.get("GLUETAIL_HOSTNAME", f"exit-{name}") == arg:
+            return name
+    return arg
+
+
+def pick_vpn_node(arg, cfgs):
+    vpn = [n for n, c in cfgs.items() if c.get("GLUETAIL_TYPE", "vpn") == "vpn"]
+    listing = ", ".join(vpn) or "none configured"
+    if arg is None:
+        if len(vpn) == 1:
+            return vpn[0]
+        raise GluetailError(f"which node? VPN nodes: {listing} (see `gluetail nodes`)")
+    name = resolve_name(arg, cfgs)
+    if name in cfgs and name not in vpn:
+        raise GluetailError(f"'{name}' is a direct node with no VPN, so it has no country to change")
+    if name not in vpn:
+        raise GluetailError(f"unknown node '{arg}'; VPN nodes: {listing} (see `gluetail nodes`)")
+    return name
+
+
+def container_states():
+    out = run_docker("ps", "-a", "--filter", "name=gluetail-", "--format", "{{.Names}}\t{{.State}}")
+    return dict(line.split("\t", 1) for line in out.splitlines() if "\t" in line)
+
+
+def cmd_nodes(args):
+    rows = summarize_nodes(load_node_files(os.path.join(args.root, "nodes")), container_states())
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no nodes configured: copy nodes/*.env.example to nodes/<name>.env, then `gluetail render`")
+        return 1
+    print(f"{'NODE':<12} {'TYPE':<7} {'TAILNET NAME':<18} {'PROVIDER':<10} {'COUNTRIES':<22} STATE")
+    for r in rows:
+        print(f"{r['node']:<12} {r['type']:<7} {r['hostname']:<18} {r['provider']:<10} {r['countries']:<22} {r['state']}")
+    return 0
+
+
+def node_from_args(args):
+    cfgs = load_node_files(os.path.join(args.root, "nodes"))
+    return get_node(pick_vpn_node(args.node, cfgs))
+
+
+def cmd_render(args):
+    root = args.root
+    text = render_compose(load_node_files(os.path.join(root, "nodes")), os.path.join(root, "templates"))
+    out = os.path.join(root, "docker-compose.yml")
+    with open(out, "w") as f:
+        f.write(text)
+    print(f"wrote {out}")
+    return 0
+
+
+def update_env_file(path, key, value):
+    if any(c in value for c in "\r\n\0"):
+        raise GluetailError("refusing to write a value containing control characters")
+    lines = []
+    if os.path.exists(path):
+        with open(path) as f:
+            lines = f.read().splitlines()
+    new = f"{key}={value}"
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = new
+            break
+    else:
+        lines.append(new)
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def set_country(node, requested, persist=True, timeout=90):
+    countries = resolve_countries(requested, node_countries(node))
+    api(node, "PUT", "/v1/vpn/settings",
+        {"provider": {"server_selection": {"countries": [c.lower() for c in countries]}}})
+    wanted = {c.lower() for c in countries}
+    deadline = time.time() + timeout
+    seen = None
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            if api(node, "GET", "/v1/vpn/status")["status"] == "running":
+                ip = api(node, "GET", "/v1/publicip/ip")
+                seen = ip
+                if (ip.get("country") or "").lower() in wanted:
+                    break
+        except GluetailError:
+            pass  # control API can blink while the VPN restarts
+    else:
+        raise GluetailError(f"{node.name}: VPN did not come back in {timeout}s in {', '.join(countries)}"
+                            + (f" (last seen: {seen.get('country')})" if seen else ""))
+    if persist:
+        if not node.working_dir:
+            raise GluetailError("applied, but cannot find the compose directory to save the choice")
+        update_env_file(os.path.join(node.working_dir, "nodes", f"{node.name}.env"),
+                        "SERVER_COUNTRIES", ",".join(countries))
+    return {"node": node.name, "countries": countries, "public_ip": seen.get("public_ip"),
+            "country": seen.get("country"), "city": seen.get("city"), "persisted": persist}
+
+
+def cmd_status(args):
+    rows = [node_status(n) for n in discover_nodes()]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no gluetail VPN nodes found (is the stack up?)")
+        return 1
+    for r in rows:
+        where = ", ".join(x for x in (r.get("city"), r.get("country")) if x)
+        if not where:
+            where = "(IP lookup pending)" if r.get("vpn") == "running" else "-"
+        print(f"{r['node']:<12} container={r['container']:<9} vpn={r.get('vpn', '?'):<8} "
+              f"ip={r.get('public_ip') or '-':<16} {where}" + (f"  [{r['error']}]" if "error" in r else ""))
+    return 0
+
+
+def cmd_countries(args):
+    for c in node_countries(node_from_args(args)):
+        print(c)
+    return 0
+
+
+def cmd_set_country(args):
+    res = set_country(node_from_args(args), args.country, persist=not args.no_persist, timeout=args.timeout)
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        note = f"saved to nodes/{res['node']}.env" if res["persisted"] else "not saved (reverts on recreate)"
+        print(f"{res['node']}: now exiting via {res['city']}, {res['country']} ({res['public_ip']}); {note}")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="gluetail", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("status", help="show every VPN node's state and exit location")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("render", help="generate docker-compose.yml from nodes/*.env")
+    s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_render)
+    s = sub.add_parser("nodes", help="list configured nodes and their state")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_nodes)
+    s = sub.add_parser("countries", help="list countries a node can use")
+    s.add_argument("node", nargs="?", help="node name or tailnet name (optional if there is one VPN node)")
+    s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_countries)
+    s = sub.add_parser("set-country", help="change a node's exit country")
+    s.add_argument("node", help="node name or tailnet name, see `gluetail nodes`")
+    s.add_argument("country", nargs="+")
+    s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
+    s.add_argument("--no-persist", action="store_true", help="do not save the choice to the node file")
+    s.add_argument("--timeout", type=int, default=90)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_set_country)
+    args = p.parse_args(argv)
+    try:
+        return args.fn(args)
+    except GluetailError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,46 @@
+
+  # Node "@@NAME@@": exits through a VPN. gluetun holds the tunnel; Tailscale
+  # shares its network namespace. Provider, countries and any other gluetun
+  # option live in nodes/@@NAME@@.env; credentials in the secrets file.
+  gluetun-@@NAME@@:
+    <<: *gluetun
+    profiles: ["@@NAME@@"]
+    container_name: gluetail-gluetun-@@NAME@@
+    labels:
+      - gluetail.node=@@NAME@@
+    env_file:
+      - @@SECRETS@@
+      - nodes/@@NAME@@.env
+    environment:
+      - HTTP_CONTROL_SERVER_ADDRESS=:8000
+      - TZ=${TZ:-UTC}
+    volumes:
+      - ${GLUETAIL_DATA_DIR:-./data}/@@NAME@@/gluetun:/gluetun
+      - ./gluetun/auth.toml:/gluetun/auth/config.toml:ro
+      - ./gluetun/post-rules.txt:/iptables/post-rules.txt:ro
+
+  ts-@@NAME@@:
+    <<: *tailscale-exit
+    profiles: ["@@NAME@@"]
+    container_name: gluetail-ts-@@NAME@@
+    network_mode: "service:gluetun-@@NAME@@"
+    depends_on:
+      gluetun-@@NAME@@:
+        condition: service_healthy
+    # gluetun routes every unmarked packet into the VPN (ip rule 101), which
+    # would send replies for tailnet clients out through the tunnel instead of
+    # back to tailscale0. Route the tailnet range to Tailscale's table first.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        ip rule add to 100.64.0.0/10 lookup 52 priority 99 2>/dev/null || true
+        ip -6 rule add to fd7a:115c:a1e0::/48 lookup 52 priority 99 2>/dev/null || true
+        exec /usr/local/bin/containerboot
+    environment:
+      - TS_HOSTNAME=@@HOSTNAME@@
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_EXTRA_ARGS=--advertise-exit-node @@TS_ARGS@@
+    volumes:
+      - ${GLUETAIL_DATA_DIR:-./data}/@@NAME@@/tailscale:/var/lib/tailscale

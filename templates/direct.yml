@@ -1,0 +1,19 @@
+
+  # Node "@@NAME@@": exits through this machine's own IP (no VPN).
+  ts-@@NAME@@:
+    <<: *tailscale-exit
+    profiles: ["@@NAME@@"]
+    container_name: gluetail-ts-@@NAME@@
+    hostname: @@HOSTNAME@@
+    networks:
+      - gluetail
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    environment:
+      - TS_HOSTNAME=@@HOSTNAME@@
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_EXTRA_ARGS=--advertise-exit-node @@TS_ARGS@@
+    volumes:
+      - ${GLUETAIL_DATA_DIR:-./data}/@@NAME@@/tailscale:/var/lib/tailscale
