@@ -3,8 +3,45 @@
 Tailscale exit nodes you pick from any device: one with no VPN, others that
 send your traffic out through a VPN provider via [gluetun](https://github.com/qdm12/gluetun).
 
-> Status: early. Working: `direct` (no VPN) and VPN nodes (gluetun + ProtonVPN tested)
-> exit nodes. Planned: Mullvad node, country switching, mobile-friendly web UI.
+> Status: early. Working: `direct` (no VPN) and VPN nodes (ProtonVPN tested), a CLI, and a
+> mobile-friendly web UI with filters generated from gluetun's server data. Untested: Mullvad
+> and paid-plan filters (no account available to test with).
+
+## How it works
+
+```mermaid
+flowchart LR
+    phone["Client device<br/>on your tailnet"]
+
+    subgraph server["Your server (Docker Compose)"]
+        subgraph direct["node: direct"]
+            ts1["Tailscale<br/>exit node"]
+        end
+        subgraph vpn["node: proton, mullvad, ..."]
+            ts2["Tailscale<br/>exit node"]
+            gl["gluetun<br/>VPN client"]
+            ts2 -.- |"same network namespace"| gl
+        end
+        subgraph ui["web UI"]
+            serve["tailscale serve<br/>HTTPS"] --> web["gluetail UI"]
+        end
+        web -->|"control API<br/>private network"| gl
+        web -->|"edits"| files[("nodes/*.env")]
+    end
+
+    phone -->|"pick exit node: exit-direct"| ts1 --> net1(["Internet<br/>your own IP"])
+    phone -->|"pick exit node: exit-proton"| ts2
+    gl ==>|"WireGuard tunnel"| prov["VPN provider<br/>Proton, Mullvad, ..."] --> net2(["Internet<br/>provider's IP"])
+    phone -->|"open the page to change country"| serve
+```
+
+- Every **exit node** is a Tailscale container that advertises itself as an exit node. You choose
+  one (or none) in the Tailscale app on any device.
+- A **VPN node** runs its Tailscale container *inside a gluetun container's network namespace*, so
+  everything it forwards leaves through gluetun's VPN tunnel. The **direct** node has no gluetun and
+  uses the server's own connection.
+- The **CLI** and the **web UI** change a VPN node's country, city and other filters live through
+  gluetun's control API, and remember the choice in `nodes/<name>.env`.
 
 ## Prerequisites on a new machine
 
@@ -117,6 +154,39 @@ if the VPN still fails to come up the previous selection is restored.
 The switch applies live (the VPN restarts in a few seconds; clients on that exit
 node reconnect). Saving to the node file means a `docker compose up -d --force-recreate`
 keeps the choice. Tests: `python3 -m unittest discover -s tests`.
+
+## Web UI
+
+A small mobile-friendly page on top of the same logic as the CLI: one card per node
+with its state and exit location, and generated controls for the provider's
+filters (countries and cities with server counts, toggles, free/paid aware).
+Plain HTML + vanilla JS served by `./gluetail serve` (Python stdlib, no build step).
+
+Enable it by adding `ui` to `COMPOSE_PROFILES` in `.env` and running
+`./gluetail render && docker compose up -d`. It listens on `127.0.0.1:8421` by default
+(`GLUETAIL_UI_BIND` changes that). Access options:
+
+- **Tailscale** (recommended): `tailscale serve --bg --https=8443 http://127.0.0.1:8421` on the host gives an
+  HTTPS address on your tailnet (`https://<host>.<tailnet>.ts.net:8443`; use a port other than 443
+  if something else on the host already listens there, e.g. a reverse proxy). Needs HTTPS certificates
+  enabled in your tailnet and keep the UI on `127.0.0.1` and passes the caller's identity to the page. Set
+  `GLUETAIL_UI_USERS=you@example.com` to allow only those Tailscale logins (the page
+  footer shows who you are signed in as).
+- **Reverse proxy** (Caddy, Traefik, ...): proxy to the published port and put your own
+  authentication in front of it.
+- **Quick test:** bind to the host's Tailscale address, e.g.
+  `GLUETAIL_UI_BIND=100.x.y.z:8421`. Everything on your tailnet that your ACLs allow
+  can then use it; there is no login. If Docker starts before Tailscale after a reboot
+  the bind can fail; prefer `tailscale serve`.
+
+Anyone who can reach the page can change your VPN settings, so do not expose it to the
+internet without authentication. What it can touch is limited by design: no Docker
+socket, the gluetun control API only over the private `gluetail` network, write access
+to `nodes/*.env` only, and read-only access to each node's gluetun directory (server
+list), never the Tailscale state or your credentials. A strict Content-Security-Policy
+is set and all data is inserted into the page as text. The page uses a bundled copy of
+[JetBrains Mono](https://www.jetbrains.com/lp/mono/) (SIL Open Font License 1.1, see
+`web/fonts/OFL.txt`), so it needs nothing from the internet.
 
 ## Running under systemd (optional)
 

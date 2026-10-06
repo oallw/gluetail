@@ -1,4 +1,4 @@
-import importlib.machinery, importlib.util, os, tempfile, unittest
+import importlib.machinery, importlib.util, json, os, tempfile, threading, unittest
 from unittest import mock
 
 _path = os.path.join(os.path.dirname(__file__), "..", "gluetail")
@@ -39,7 +39,7 @@ SERVERS = {
 class ParseNode(unittest.TestCase):
     def test_fields(self):
         n = g.parse_node(INSPECT)
-        self.assertEqual((n.name, n.state, n.ip), ("proton", "running", "172.29.0.3"))
+        self.assertEqual((n.name, n.state, n.host), ("proton", "running", "172.29.0.3"))
         self.assertEqual((n.provider, n.free_only), ("protonvpn", True))
         self.assertEqual(n.working_dir, "/opt/gluetail")
         self.assertEqual(n.servers_json, "/var/lib/gluetail/proton/gluetun/servers.json")
@@ -49,7 +49,7 @@ class ParseNode(unittest.TestCase):
 
     def test_not_on_network_has_no_ip(self):
         i = dict(INSPECT, NetworkSettings={"Networks": {}})
-        self.assertIsNone(g.parse_node(i).ip)
+        self.assertIsNone(g.parse_node(i).host)
 
 
 class DecodeBody(unittest.TestCase):
@@ -142,6 +142,14 @@ class Render(unittest.TestCase):
             self.assertIn(expected, out)
         self.assertNotIn("@@", out)
         self.assertNotIn("gluetun-plain", out)
+        self.assertIn("gluetail-ui", out)
+        ui = out.split("\n  ui:\n")[1]  # the UI never gets Tailscale state (node private keys)
+        self.assertIn("/proton/gluetun:/data/proton/gluetun:ro", ui)
+        self.assertNotIn("tailscale", ui.replace("tailnet", ""))
+        self.assertNotIn("/plain", ui)
+
+    def test_no_ui_without_vpn_nodes(self):
+        self.assertNotIn("gluetail-ui", g.render_compose({"plain": {"GLUETAIL_TYPE": "direct"}}, TEMPLATES))
 
     def test_defaults_secrets_path(self):
         out = g.render_compose({"mv": {"VPN_SERVICE_PROVIDER": "mullvad"}}, TEMPLATES)
@@ -272,6 +280,25 @@ class Schema(unittest.TestCase):
         self.assertEqual([x["value"] for x in self.facet(o, "cities")["options"]], ["Chicago", "Denver", "Miami"])
         self.assertEqual(len(self.facet(o, "countries")["options"]), 4)  # own facet is not self-filtered
 
+    def test_city_does_not_narrow_countries(self):
+        o = self.opts({"countries": ["united states"], "cities": ["chicago"]}, False)
+        self.assertEqual(len(self.facet(o, "countries")["options"]), 4)
+        self.assertEqual([x["value"] for x in self.facet(o, "cities")["options"]], ["Chicago", "Denver", "Miami"])
+
+    def test_orthogonal_filters_still_narrow_countries(self):
+        o = self.opts({"secure_core_only": True}, False)
+        self.assertEqual([x["value"] for x in self.facet(o, "countries")["options"]], ["Germany"])
+
+    def test_prune_drops_cities_of_other_countries(self):
+        sel, removed = g.prune_selection(SCHEMA_SERVERS, self.facets, self.unsupported,
+                                         {"countries": ["Japan"], "cities": ["Chicago", "Tokyo"]}, False)
+        self.assertEqual((sel["cities"], removed), (["Tokyo"], {"cities": ["Chicago"]}))
+
+    def test_prune_leaves_valid_selection_alone(self):
+        sel, removed = g.prune_selection(SCHEMA_SERVERS, self.facets, self.unsupported,
+                                         {"countries": ["Germany"], "cities": ["berlin"], "secure_core_only": True}, False)
+        self.assertEqual((sel["cities"], removed), (["berlin"], {}))
+
     def test_impossible_selection_has_zero_matches(self):
         self.assertEqual(self.opts({"countries": ["japan"], "cities": ["chicago"]}, False)["match_count"], 0)
 
@@ -358,10 +385,145 @@ class SetFilters(unittest.TestCase):
         self.assertIn("no servers on your plan", str(cm.exception))
         self.assertEqual(self.puts(), [])
 
+    def test_only_changed_values_are_persisted(self):
+        g.set_filters(self.NODE, ["countries=japan", "secure_core_only=off", "cities=", "multi_hop_only=off"])
+        self.assertEqual(self.writes, [])  # everything equals the saved selection (case-insensitively)
+
     def test_clear_filter_writes_empty_value(self):
         self.current["cities"] = ["Tokyo"]
         g.set_filters(self.NODE, ["cities="])
         self.assertEqual(self.writes, [("SERVER_CITIES", "")])
+
+
+class WebApp(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = self.tmp.name
+        os.makedirs(os.path.join(root, "nodes"))
+        os.makedirs(os.path.join(root, "web"))
+        os.makedirs(os.path.join(root, "web", "fonts"))
+        for name, content in (("index.html", "<html>ui</html>"), ("app.js", "//js"), ("style.css", "/*c*/")):
+            with open(os.path.join(root, "web", name), "w") as f:
+                f.write(content)
+        with open(os.path.join(root, "web", "fonts", "jetbrains-mono-400.woff2"), "wb") as f:
+            f.write(b"wOF2fake")
+        with open(os.path.join(root, "nodes", "p.env"), "w") as f:
+            f.write("VPN_SERVICE_PROVIDER=prov\nFREE_ONLY=on\n")
+        with open(os.path.join(root, "nodes", "d.env"), "w") as f:
+            f.write("GLUETAIL_TYPE=direct\n")
+        self.app = g.App(root, os.path.join(root, "data"))
+        self.facets, self.unsupported = g.build_facets(SCHEMA_SERVERS)
+        view = (SCHEMA_SERVERS, self.facets, self.unsupported, {"countries": ["Japan"], "cities": []}, True)
+        for p in (mock.patch.object(g, "node_view", lambda n: view),
+                  mock.patch.object(g, "node_status", lambda n: {"node": n.name, "vpn": "running",
+                                                                  "public_ip": "9.9.9.9", "country": "Japan"})):
+            p.start(); self.addCleanup(p.stop)
+
+    def req(self, method, path, body=None, headers=None, ctype="application/json"):
+        h = dict(headers or {})
+        if body is not None:
+            h["Content-Type"] = ctype
+        status, hdrs, payload = self.app.handle(method, path, h, json.dumps(body).encode() if body is not None else b"")
+        return status, hdrs, payload
+
+    def test_static_files_and_security_headers(self):
+        status, hdrs, body = self.req("GET", "/")
+        self.assertEqual((status, body), (200, b"<html>ui</html>"))
+        self.assertIn("default-src 'self'", hdrs["Content-Security-Policy"])
+        self.assertEqual(self.req("GET", "/static/app.js")[0], 200)
+        status, hdrs, body = self.req("GET", "/static/fonts/jetbrains-mono-400.woff2")
+        self.assertEqual((status, hdrs["Content-Type"], body), (200, "font/woff2", b"wOF2fake"))
+        self.assertIn("max-age", hdrs["Cache-Control"])
+        self.assertEqual(self.req("GET", "/static/app.js")[1]["Content-Type"], "text/javascript; charset=utf-8")
+        self.assertEqual(self.req("GET", "/static/../gluetail")[0], 404)  # only whitelisted files
+        self.assertEqual(self.req("GET", "/static/fonts/../../gluetail")[0], 404)
+        self.assertEqual(self.req("GET", "/static/fonts/OFL.txt")[0], 404)
+        self.assertEqual(self.req("GET", "/static/secret.txt")[0], 404)
+
+    def test_list_nodes_includes_direct_and_vpn(self):
+        status, _, body = self.req("GET", "/api/nodes")
+        rows = {r["node"]: r for r in json.loads(body)}
+        self.assertEqual(status, 200)
+        self.assertEqual(rows["p"]["vpn"], "running")
+        self.assertEqual(rows["p"]["plan"], "free")
+        self.assertEqual(rows["d"]["type"], "direct")
+        self.assertNotIn("state", rows["d"])
+
+    def test_preview_applies_selection_without_touching_the_vpn(self):
+        with mock.patch.object(g, "api", side_effect=AssertionError("preview must not call gluetun")):
+            status, _, body = self.req("POST", "/api/nodes/p/preview", {"selection": {"countries": ["United States"]}})
+        opts = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual({o["value"] for o in next(f for f in opts["facets"] if f["key"] == "cities")["options"]},
+                         {"Chicago", "Miami"})
+
+    def test_preview_prunes_conflicting_city_and_reports_it(self):
+        _, _, body = self.req("POST", "/api/nodes/p/preview",
+                              {"selection": {"countries": ["Japan"], "cities": ["Chicago"]}})
+        opts = json.loads(body)
+        self.assertEqual(opts["pruned"], {"cities": ["Chicago"]})
+        self.assertEqual(next(f for f in opts["facets"] if f["key"] == "cities")["selected"], [])
+        self.assertEqual(opts["match_count"], 1)
+
+    def test_preview_ignores_unknown_keys(self):
+        status, _, body = self.req("POST", "/api/nodes/p/preview", {"selection": {"__proto__": ["x"], "bogus": True}})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["match_count"], 3)
+
+    def test_post_requires_json_content_type(self):
+        self.assertEqual(self.req("POST", "/api/nodes/p/preview", {"selection": {}}, ctype="text/plain")[0], 415)
+
+    def test_unknown_or_direct_node_is_a_clean_error(self):
+        for name in ("nope", "d"):
+            status, _, body = self.req("POST", f"/api/nodes/{name}/preview", {"selection": {}})
+            self.assertEqual(status, 400)
+            self.assertIn("unknown VPN node", json.loads(body)["error"])
+
+    def test_bad_json_and_bad_body(self):
+        status, _, _ = self.app.handle("POST", "/api/nodes/p/set", {"Content-Type": "application/json"}, b"{nope")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.req("POST", "/api/nodes/p/set", {"selection": "x"})[0], 400)
+
+    def test_set_converts_selection_and_reports_errors(self):
+        with mock.patch.object(g, "set_filters", return_value={"node": "p", "unchanged": False}) as sf:
+            status, _, _ = self.req("POST", "/api/nodes/p/set", {"selection": {"countries": ["Japan"], "secure_core_only": False}})
+        self.assertEqual(status, 200)
+        self.assertEqual(sf.call_args[0][1], ["countries=Japan", "secure_core_only=off"])
+        with mock.patch.object(g, "set_filters", side_effect=g.GluetailError("no server matches")):
+            status, _, body = self.req("POST", "/api/nodes/p/set", {"selection": {"countries": ["Japan"]}})
+        self.assertEqual((status, json.loads(body)["error"]), (400, "no server matches"))
+
+    def test_concurrent_change_is_rejected(self):
+        self.app._locks["p"] = threading.Lock()
+        self.app._locks["p"].acquire()
+        status, _, body = self.req("POST", "/api/nodes/p/set", {"selection": {"countries": ["Japan"]}})
+        self.assertEqual(status, 409)
+        self.assertIn("busy", json.loads(body)["error"])
+
+    def test_internal_errors_do_not_leak_details(self):
+        with mock.patch.object(g, "list_nodes_marker", create=True), \
+             mock.patch.object(g.App, "list_nodes", side_effect=RuntimeError("secret path /private/x")):
+            status, _, body = self.req("GET", "/api/nodes")
+        self.assertEqual(status, 500)
+        self.assertNotIn("secret", body.decode())
+
+    def test_allowlist(self):
+        app = g.App(self.app.root, self.app.data_dir, ["me@example.com"])
+        self.assertEqual(app.handle("GET", "/api/me", {})[0], 403)
+        self.assertEqual(app.handle("GET", "/api/me", {"Tailscale-User-Login": "other@example.com"})[0], 403)
+        status, _, body = app.handle("GET", "/api/me", {"tailscale-user-login": "ME@example.com"})
+        self.assertEqual((status, json.loads(body)["user"]), (200, "ME@example.com"))
+
+
+class SelectionItems(unittest.TestCase):
+    def test_roundtrip(self):
+        self.assertEqual(g.selection_to_items({"countries": ["A", "B"], "secure_core_only": True, "cities": []}),
+                         ["countries=A,B", "secure_core_only=on", "cities="])
+
+    def test_rejects_other_types(self):
+        with self.assertRaises(g.GluetailError):
+            g.selection_to_items({"countries": "Japan"})
 
 
 if __name__ == "__main__":

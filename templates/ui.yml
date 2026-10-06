@@ -1,0 +1,29 @@
+
+  # Web UI (profile "ui"): a mobile-friendly page on top of the same logic as the CLI.
+  # No Docker socket: it reaches each gluetun by container name, edits nodes/*.env,
+  # and reads only each node's gluetun directory (server list), not Tailscale state.
+  ui:
+    image: python:3.12-alpine
+    profiles: ["ui"]
+    container_name: gluetail-ui
+    restart: unless-stopped
+    user: "${GLUETAIL_UID:-1000}:${GLUETAIL_GID:-1000}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    command: ["python", "/app/gluetail", "serve", "--root", "/app", "--data-dir", "/data", "--bind", "0.0.0.0", "--port", "8421"]
+    environment:
+      - GLUETAIL_UI_USERS=${GLUETAIL_UI_USERS:-}
+    ports:
+      - "${GLUETAIL_UI_BIND:-127.0.0.1:8421}:8421"
+    networks:
+      - gluetail
+    volumes:
+      - ./gluetail:/app/gluetail:ro
+      - ./web:/app/web:ro
+      - ./nodes:/app/nodes
+@@NODE_MOUNTS@@

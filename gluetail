@@ -12,9 +12,11 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,7 +34,7 @@ class Node:
     name: str
     container: str
     state: str
-    ip: Optional[str]
+    host: Optional[str]  # control API address: container IP (docker mode) or name (file mode)
     provider: str
     free_only: bool
     working_dir: Optional[str]
@@ -65,7 +67,7 @@ def parse_node(inspect):
         name=name,
         container=inspect["Name"].lstrip("/"),
         state=inspect["State"]["Status"],
-        ip=net.get("IPAddress") or None,
+        host=net.get("IPAddress") or None,
         provider=env.get("VPN_SERVICE_PROVIDER", ""),
         free_only=env.get("FREE_ONLY", "").lower() in ("on", "yes", "true", "1"),
         working_dir=labels.get("com.docker.compose.project.working_dir"),
@@ -100,10 +102,10 @@ def decode_body(raw):
 
 
 def api(node, method, path, body=None, timeout=5):
-    if not node.ip:
+    if not node.host:
         raise GluetailError(f"{node.name}: container is not running on the '{NETWORK}' network")
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(f"http://{node.ip}:{API_PORT}{path}", data=data, method=method,
+    req = urllib.request.Request(f"http://{node.host}:{API_PORT}{path}", data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -202,6 +204,7 @@ def render_compose(nodes, template_dir):
             return f.read()
 
     parts = [tpl("header.yml")]
+    vpn_nodes = []
     if not nodes:
         raise GluetailError("no nodes found: create nodes/<name>.env (see nodes/*.env.example)")
     for name, cfg in nodes.items():
@@ -220,11 +223,16 @@ def render_compose(nodes, template_dir):
                 raise GluetailError(f"{name}: {label} must not contain '$' or control characters")
         if kind == "vpn" and "VPN_SERVICE_PROVIDER" not in cfg:
             raise GluetailError(f"{name}: VPN nodes need VPN_SERVICE_PROVIDER (e.g. protonvpn, mullvad)")
+        if kind == "vpn":
+            vpn_nodes.append(name)
         text = tpl(f"{kind}.yml")
         for key, value in (("@@NAME@@", name), ("@@HOSTNAME@@", hostname), ("@@TS_ARGS@@", ts_args),
                            ("@@SECRETS@@", json.dumps(secrets))):
             text = text.replace(key, value)
         parts.append(text)
+    if vpn_nodes:
+        mounts = "".join(f"      - ${{GLUETAIL_DATA_DIR:-./data}}/{n}/gluetun:/data/{n}/gluetun:ro\n" for n in vpn_nodes)
+        parts.append(tpl("ui.yml").replace("@@NODE_MOUNTS@@\n", mounts))
     return "".join(parts)
 
 
@@ -315,6 +323,9 @@ FLAG_NAME_EXCEPTIONS = {"multihop": "multi_hop"}
 NON_FILTER_FIELDS = {"vpn", "ips", "tcp", "udp", "wgpubkey", "hostname", "server_name", "number", "port",
                      "categories", "port_forward_ports"}
 PLAN_FIELD = "free"
+# Geography is a hierarchy: a child (city) never narrows its parent's options, so picking a
+# city does not lock you out of other countries. Other filters (ISP, toggles) apply both ways.
+GEO_CHILDREN = {"countries": {"regions", "cities"}, "regions": {"cities"}}
 TRUTHY = ("on", "yes", "true", "1")
 
 
@@ -342,9 +353,10 @@ def build_facets(servers):
     return facets, unsupported
 
 
-def server_matches(server, selection, facets, skip=None):
+def server_matches(server, selection, facets, skip=()):
+    skip = {skip} if isinstance(skip, str) else set(skip)
     for f in facets:
-        if f["key"] == skip or f["kind"] == "plan":
+        if f["key"] in skip or f["kind"] == "plan":
             continue
         want = selection.get(f["key"])
         if not want:
@@ -364,7 +376,8 @@ def compute_options(servers, facets, unsupported, selection, free_plan):
     for f in facets:
         if f["kind"] == "plan":
             continue
-        others = [s for s in base if server_matches(s, selection, facets, skip=f["key"])]
+        skip = {f["key"]} | GEO_CHILDREN.get(f["key"], set())
+        others = [s for s in base if server_matches(s, selection, facets, skip=skip)]
         entry = {"key": f["key"], "env": f["env"], "label": f["label"], "kind": f["kind"],
                  "selected": selection.get(f["key"]) or ([] if f["kind"] == "multi" else False)}
         if f["kind"] == "multi":
@@ -381,6 +394,25 @@ def compute_options(servers, facets, unsupported, selection, free_plan):
     match_count = sum(1 for s in base if server_matches(s, selection, facets))
     return {"plan": "free" if free_plan else "all", "match_count": match_count, "facets": out,
             "unsupported": unsupported}
+
+
+def prune_selection(servers, facets, unsupported, selection, free_plan):
+    """Drop selected regions/cities that the chosen parents no longer offer; report what was dropped."""
+    sel = {k: list(v) if isinstance(v, list) else v for k, v in selection.items()}
+    removed = {}
+    for key in ("regions", "cities"):
+        if not sel.get(key):
+            continue
+        entry = next((e for e in compute_options(servers, facets, unsupported, sel, free_plan)["facets"]
+                      if e["key"] == key), None)
+        if entry is None:
+            continue
+        valid = {o["value"].lower() for o in entry["options"]}
+        gone = [v for v in sel[key] if v.lower() not in valid]
+        if gone:
+            removed[key] = gone
+            sel[key] = [v for v in sel[key] if v.lower() in valid]
+    return sel, removed
 
 
 def selection_from_env(env, facets):
@@ -498,6 +530,10 @@ def _wait_running(node, timeout):
     return None
 
 
+def _norm(value):
+    return sorted(v.lower() for v in value) if isinstance(value, list) else bool(value)
+
+
 def set_filters(node, items, persist=True, timeout=90):
     servers, facets, unsupported, selection, free_plan = node_view(node)
     # names are validated against everything the plan offers; the combination is checked below
@@ -520,10 +556,182 @@ def set_filters(node, items, persist=True, timeout=90):
     if persist:
         by_key = {f["key"]: f for f in facets}
         for key, value in changes.items():
+            if _norm(value) == _norm(selection.get(key)):
+                continue  # unchanged: do not litter the node file with empty keys
             text = ",".join(value) if isinstance(value, list) else ("on" if value else "")
             update_env_file(node_file(node), by_key[key]["env"], text)
     return {"node": node.name, "unchanged": False, "selection": new_sel, "public_ip": ip.get("public_ip"),
             "country": ip.get("country"), "city": ip.get("city"), "persisted": persist}
+
+
+def node_from_files(root, data_dir, name):
+    """Build a VPN Node from nodes/<name>.env only, with no Docker access (used by the web UI)."""
+    cfgs = load_node_files(os.path.join(root, "nodes"))
+    if name not in cfgs or cfgs[name].get("GLUETAIL_TYPE", "vpn") != "vpn":
+        raise GluetailError(f"unknown VPN node '{name}'")
+    cfg = cfgs[name]
+    return Node(
+        name=name, container=f"gluetail-gluetun-{name}", state="unknown", host=f"gluetail-gluetun-{name}",
+        provider=cfg.get("VPN_SERVICE_PROVIDER", ""), free_only=cfg.get("FREE_ONLY", "").lower() in TRUTHY,
+        working_dir=root, servers_json=os.path.join(data_dir, name, "gluetun", "servers.json"),
+    )
+
+
+def selection_to_items(selection):
+    items = []
+    for key, value in selection.items():
+        if isinstance(value, bool):
+            items.append(f"{key}={'on' if value else 'off'}")
+        elif isinstance(value, list) and all(isinstance(v, str) for v in value):
+            items.append(f"{key}={','.join(value)}")
+        else:
+            raise GluetailError(f"bad value for '{key}'")
+    return items
+
+
+STATIC_FILES = {
+    "app.js": "text/javascript; charset=utf-8",
+    "style.css": "text/css; charset=utf-8",
+    "fonts/jetbrains-mono-400.woff2": "font/woff2",
+    "fonts/jetbrains-mono-700.woff2": "font/woff2",
+}
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+
+
+class App:
+    """Request handling for the web UI, kept free of sockets so it can be unit-tested."""
+
+    def __init__(self, root, data_dir, allowed_users=None):
+        self.root, self.data_dir = root, data_dir
+        self.allowed_users = {u.strip().lower() for u in (allowed_users or []) if u.strip()}
+        self.web_dir = os.path.join(root, "web")
+        self._locks = {}
+
+    def respond(self, status, payload, ctype="application/json", **extra):
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        return status, {"Content-Type": ctype, **SECURITY_HEADERS, **extra}, body
+
+    def handle(self, method, path, headers, body=b""):
+        headers = {k.lower(): v for k, v in headers.items()}
+        path = path.split("?", 1)[0]
+        if self.allowed_users and headers.get("tailscale-user-login", "").lower() not in self.allowed_users:
+            return self.respond(403, {"error": "not allowed"})
+        try:
+            if method == "GET" and path in ("/", "/index.html"):
+                return self.respond(200, self._read_static("index.html"), "text/html; charset=utf-8")
+            if method == "GET" and path.startswith("/static/") and path[8:] in STATIC_FILES:
+                cache = {"Cache-Control": "public, max-age=86400"} if path.endswith(".woff2") else {}
+                return self.respond(200, self._read_static(path[8:]), STATIC_FILES[path[8:]], **cache)
+            if method == "GET" and path == "/api/me":
+                return self.respond(200, {"user": headers.get("tailscale-user-login")})
+            if method == "GET" and path == "/api/nodes":
+                return self.respond(200, self.list_nodes())
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[:2] == ["api", "nodes"]:
+                name, action = parts[2], parts[3]
+                if method == "GET" and action == "options":
+                    return self.respond(200, get_options(self.node(name)))
+                if method == "POST" and action in ("preview", "set"):
+                    if not headers.get("content-type", "").startswith("application/json"):
+                        return self.respond(415, {"error": "send application/json"})
+                    selection = json.loads(body or b"{}").get("selection")
+                    if not isinstance(selection, dict):
+                        raise GluetailError("body must be {\"selection\": {...}}")
+                    return self.respond(200, self.preview(name, selection) if action == "preview"
+                                        else self.apply(name, selection))
+            return self.respond(404, {"error": "not found"})
+        except GluetailError as e:
+            return self.respond(409 if "busy" in str(e) else 400, {"error": str(e)})
+        except ValueError:
+            return self.respond(400, {"error": "invalid JSON"})
+        except Exception as e:  # keep the server up; details go to the log, not the client
+            print(f"internal error on {method} {path}: {e!r}", file=sys.stderr)
+            return self.respond(500, {"error": "internal error"})
+
+    def _read_static(self, fname):
+        with open(os.path.join(self.web_dir, fname), "rb") as f:
+            return f.read()
+
+    def node(self, name):
+        return node_from_files(self.root, self.data_dir, name)
+
+    def list_nodes(self):
+        rows = []
+        for r in summarize_nodes(load_node_files(os.path.join(self.root, "nodes")), {}):
+            r.pop("state")
+            if r["type"] == "vpn":
+                node = self.node(r["node"])
+                r.update({k: v for k, v in node_status(node).items() if k not in ("node", "provider")})
+                try:
+                    r["plan"] = get_options(node)["plan"]
+                except GluetailError:
+                    pass
+            rows.append(r)
+        return rows
+
+    def preview(self, name, selection):
+        servers, facets, unsupported, _, free_plan = node_view(self.node(name))
+        known = {f["key"] for f in facets if f["kind"] != "plan"}
+        clean = {k: v for k, v in selection.items() if k in known}
+        pruned, removed = prune_selection(servers, facets, unsupported, clean, free_plan)
+        opts = compute_options(servers, facets, unsupported, pruned, free_plan)
+        opts["pruned"] = removed
+        return opts
+
+    def apply(self, name, selection):
+        lock = self._locks.setdefault(name, threading.Lock())
+        if not lock.acquire(blocking=False):
+            raise GluetailError(f"{name}: busy, another change is in progress")
+        try:
+            return set_filters(self.node(name), selection_to_items(selection))
+        finally:
+            lock.release()
+
+
+def make_handler(app):
+    class Handler(BaseHTTPRequestHandler):
+        def _serve(self, method):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(min(length, 65536)) if length else b""
+            status, headers, payload = app.handle(method, self.path, dict(self.headers), body)
+            self.send_response(status)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            self._serve("GET")
+
+        def do_POST(self):
+            self._serve("POST")
+
+        def log_message(self, fmt, *a):
+            print(f"{self.client_address[0]} {fmt % a}", file=sys.stderr)
+
+    return Handler
+
+
+def cmd_serve(args):
+    users = [u for u in (args.users or os.environ.get("GLUETAIL_UI_USERS", "")).split(",") if u.strip()]
+    app = App(args.root, args.data_dir, users)
+    if not users and args.bind not in ("127.0.0.1", "localhost", "::1"):
+        print("warning: no user allowlist (GLUETAIL_UI_USERS) and not bound to loopback: anyone who can reach "
+              "this port can change VPN settings. Put it behind tailscale serve or an authenticating proxy.",
+              file=sys.stderr)
+    httpd = ThreadingHTTPServer((args.bind, args.port), make_handler(app))
+    print(f"gluetail UI on http://{args.bind}:{args.port} (nodes: {args.root}/nodes)", file=sys.stderr)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 def cmd_status(args):
@@ -600,6 +808,14 @@ def main(argv=None):
     s = sub.add_parser("status", help="show every VPN node's state and exit location")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("serve", help="run the web UI (mobile-friendly page on top of the same logic)")
+    s.add_argument("--root", default=SCRIPT_DIR, help="directory containing nodes/ and web/")
+    s.add_argument("--data-dir", default=os.environ.get("GLUETAIL_DATA_DIR", os.path.join(SCRIPT_DIR, "data")),
+                   help="directory with <node>/gluetun/servers.json")
+    s.add_argument("--bind", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8421)
+    s.add_argument("--users", help="comma-separated Tailscale logins allowed (default: $GLUETAIL_UI_USERS)")
+    s.set_defaults(fn=cmd_serve)
     s = sub.add_parser("render", help="generate docker-compose.yml from nodes/*.env")
     s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_render)
