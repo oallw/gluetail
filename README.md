@@ -7,6 +7,13 @@ exits through the server's own connection or through a VPN provider via
 [gluetun](https://github.com/qdm12/gluetun). Choose a node in the Tailscale client on any device, and change a
 VPN node's country or city from the CLI or the web UI without touching the server.
 
+## Why
+
+Android and iOS run one VPN at a time. A phone that keeps Tailscale always on, to reach services at home,
+cannot also run a VPN provider's app, so private access to home and VPN egress compete for the same slot.
+gluetail provides the VPN egress as Tailscale exit nodes instead: Tailscale stays the only VPN on the device,
+and the exit node and its location are chosen from the Tailscale app, the CLI or the web UI.
+
 - **Several exit nodes side by side**: one direct, one per VPN provider or region, each selectable per device.
 - **Any provider gluetun supports**: filters such as country, city and provider-specific options are generated
   from gluetun's own server data.
@@ -19,9 +26,6 @@ flowchart LR
     device -->|"exit node: direct"| direct["direct node"] --> net1(["Internet<br/>server's own IP"])
     device -->|"exit node: vpn"| vpn["VPN node<br/>Tailscale + gluetun"] ==>|"WireGuard"| provider["VPN provider"] --> net2(["Internet<br/>provider's IP"])
 ```
-
-> **Status:** early. Tested with ProtonVPN (free plan) and Docker Compose v2 on Ubuntu. Mullvad and
-> paid-plan features are untested.
 
 ## Quick start
 
@@ -60,6 +64,8 @@ sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=direct,proton/' .env
 
 The same controls are available in a web UI (`ui` profile), see [docs/web-ui.md](docs/web-ui.md).
 
+<img src="docs/images/web-ui.jpg" alt="gluetail web UI: a card per node with state, exit location and generated filters" width="320">
+
 ## Configuration
 
 A node is a file, `nodes/<name>.env`. Keys starting with `GLUETAIL_` configure gluetail; everything else is
@@ -71,6 +77,68 @@ VPN_SERVICE_PROVIDER=protonvpn
 VPN_TYPE=wireguard
 SERVER_COUNTRIES=Netherlands
 ```
+
+## Without gluetail
+
+gluetail only generates Compose files. To run the setup by hand, this is the core of what `gluetail up` renders
+for a VPN node: a Tailscale container shares gluetun's network namespace, so everything it forwards leaves
+through the VPN tunnel.
+
+```yaml
+# docker-compose.yml
+services:
+  gluetun:
+    image: qmcgaw/gluetun            # pin a version; templates/header.yml has the build gluetail is tested with
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    env_file: [secrets/vpn.env]      # WIREGUARD_PRIVATE_KEY=...
+    environment:
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=wireguard
+      - SERVER_COUNTRIES=Netherlands
+    volumes:
+      - ./gluetun/post-rules.txt:/iptables/post-rules.txt:ro
+    restart: unless-stopped
+
+  tailscale:
+    image: tailscale/tailscale:v1.102.5
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    env_file: [secrets/tailscale.env]   # TS_AUTHKEY=...
+    environment:
+      - TS_HOSTNAME=exit-vpn
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_EXTRA_ARGS=--advertise-exit-node
+    command:
+      - /bin/sh
+      - -c
+      - |
+        ip rule add to 100.64.0.0/10 lookup 52 priority 99 2>/dev/null || true
+        ip -6 rule add to fd7a:115c:a1e0::/48 lookup 52 priority 99 2>/dev/null || true
+        exec /usr/local/bin/containerboot
+    volumes:
+      - ./data/tailscale:/var/lib/tailscale
+    restart: unless-stopped
+```
+
+```
+# gluetun/post-rules.txt
+iptables -I FORWARD -i tailscale0 -o tun0 -j ACCEPT
+iptables -I FORWARD -i tun0 -o tailscale0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+```
+
+The `post-rules.txt` and the two `ip rule` lines are required; [docs/troubleshooting.md](docs/troubleshooting.md)
+explains why. A direct node is the same `tailscale` service without `network_mode`, `depends_on` and `command`,
+on the default network with the two `sysctls` from above. gluetail adds the pieces around this: the generated
+filters, the control API, port publishing and the web UI.
 
 ## Documentation
 
@@ -87,5 +155,5 @@ SERVER_COUNTRIES=Netherlands
 MIT, see [LICENSE](LICENSE). The bundled JetBrains Mono font in `web/fonts/` is under the SIL Open Font
 License 1.1 (`web/fonts/OFL.txt`).
 
-gluetail is an independent project, not affiliated with or endorsed by Tailscale Inc., the gluetun project,
-Proton AG, Mullvad VPN AB or JetBrains. Using a VPN provider through it is subject to that provider's terms.
+gluetail is an independent project, not affiliated with or endorsed by Tailscale Inc. or the gluetun project.
+Using a VPN provider through it is subject to that provider's terms.
