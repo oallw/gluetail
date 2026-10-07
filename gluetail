@@ -161,6 +161,7 @@ def node_countries(node):
 NODE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$")
 TS_ARGS_RE = re.compile(r"^[A-Za-z0-9=,:._ /-]*$")
+PORT_RE = re.compile(r"^(?:(?:\d{1,3}\.){3}\d{1,3}:)?(\d{1,5}):(\d{1,5})(?:/(?:tcp|udp))?$")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -177,6 +178,8 @@ def parse_env_text(text):
             raise GluetailError(f"line {n}: expected KEY=VALUE, got '{raw}'")
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
+        else:
+            value = re.sub(r"(^|\s+)#.*$", "", value).strip()  # inline comment, as Compose does
         out[key] = value
     return out
 
@@ -226,6 +229,19 @@ def render_compose(nodes, template_dir):
         if kind == "vpn":
             vpn_nodes.append(name)
         text = tpl(f"{kind}.yml")
+        ports = [p.strip() for p in cfg.get("GLUETAIL_PORTS", "").split(",") if p.strip()]
+        for port in ports:
+            m = PORT_RE.match(port)
+            if m and m.group(2) == "8000" and not port.startswith("127.0.0.1:"):
+                raise GluetailError(f"{name}: GLUETAIL_PORTS entry '{port}' would expose gluetun's control API "
+                                    "(it can change VPN settings); bind it to loopback: 127.0.0.1:<port>:8000")
+            if not m or not all(0 < int(g) < 65536 for g in m.groups()):
+                raise GluetailError(f"{name}: invalid GLUETAIL_PORTS entry '{port}' "
+                                    "(use [bind-ip:]host:container[/tcp|/udp], e.g. 9080:8080 or 127.0.0.1:9800:8000)")
+        if ports and kind != "vpn":
+            raise GluetailError(f"{name}: GLUETAIL_PORTS only applies to VPN nodes")
+        block = "    ports:\n" + "".join(f"      - {json.dumps(p)}\n" for p in ports) if ports else ""
+        text = text.replace("@@PORTS@@\n", block)
         for key, value in (("@@NAME@@", name), ("@@HOSTNAME@@", hostname), ("@@TS_ARGS@@", ts_args),
                            ("@@SECRETS@@", json.dumps(secrets))):
             text = text.replace(key, value)
@@ -298,6 +314,129 @@ def cmd_nodes(args):
 def node_from_args(args):
     cfgs = load_node_files(os.path.join(args.root, "nodes"))
     return get_node(pick_vpn_node(args.node, cfgs))
+
+
+def find_dependents(inspected, node_container, node_id):
+    """Containers whose network namespace is the node's gluetun container (network_mode: container:...)."""
+    out = []
+    for c in inspected:
+        mode = c.get("HostConfig", {}).get("NetworkMode", "")
+        if not mode.startswith("container:"):
+            continue
+        target = mode[len("container:"):]
+        if target == node_container or (len(target) >= 12 and (node_id.startswith(target) or target.startswith(node_id))):
+            labels = c.get("Config", {}).get("Labels") or {}
+            out.append({"container": c["Name"].lstrip("/"), "state": c["State"]["Status"],
+                        "project": labels.get("com.docker.compose.project", "-"),
+                        "service": labels.get("com.docker.compose.service", "-"), "labels": labels})
+    return sorted(out, key=lambda d: d["container"])
+
+
+def cmd_dependents(args):
+    cfgs = load_node_files(os.path.join(args.root, "nodes"))
+    name = pick_vpn_node(args.node, cfgs)
+    gluetun = f"gluetail-gluetun-{name}"
+    node_id = json.loads(run_docker("inspect", gluetun))[0]["Id"]
+    ids = run_docker("ps", "-aq", "--no-trunc").split()
+    deps = find_dependents(json.loads(run_docker("inspect", *ids)) if ids else [], gluetun, node_id)
+    if args.json:
+        print(json.dumps([{k: v for k, v in d.items() if k != "labels"} for d in deps], indent=2))
+        return 0
+    print(f"containers sharing {gluetun}'s network namespace (they lose connectivity if it is recreated; "
+          f"recreate them afterwards):")
+    for d in deps:
+        print(f"  {d['container']:<28} {d['state']:<9} {d['project']}/{d['service']}")
+    return 0
+
+
+def snapshot_nodes(vpn_names):
+    """For each VPN node: its gluetun container id and compose project, and who is attached to it."""
+    ids = run_docker("ps", "-aq", "--no-trunc").split()
+    inspected = json.loads(run_docker("inspect", *ids)) if ids else []
+    by_name = {c["Name"].lstrip("/"): c for c in inspected}
+    out = {}
+    for name in vpn_names:
+        c = by_name.get(f"gluetail-gluetun-{name}")
+        if not c:
+            out[name] = {"id": None, "project": None, "deps": []}
+            continue
+        project = (c["Config"].get("Labels") or {}).get("com.docker.compose.project")
+        # containers of gluetail's own project (the Tailscale sidecar) are recreated by compose itself
+        deps = [d for d in find_dependents(inspected, c["Name"].lstrip("/"), c["Id"]) if d["project"] != project]
+        out[name] = {"id": c["Id"], "project": project, "deps": deps}
+    return out
+
+
+def plan_recreations(before, after):
+    """(node, dependent) pairs for nodes whose gluetun container was replaced during `up`."""
+    steps = []
+    for node, b in before.items():
+        a = after.get(node)
+        if b["id"] and a and a["id"] and a["id"] != b["id"]:
+            steps += [(node, d) for d in b["deps"]]
+    return steps
+
+
+def recreate_commands(steps):
+    """Group dependents by compose project into `docker compose up -d --force-recreate --no-deps` commands.
+
+    Returns (commands, unmanaged): commands are (argv, [container names]); unmanaged are dependents that
+    carry no compose labels and so cannot be recreated automatically."""
+    groups, unmanaged = {}, []
+    for node, d in steps:
+        lab = d["labels"]
+        key = tuple(lab.get(f"com.docker.compose.{k}") for k in ("project", "project.working_dir", "project.config_files"))
+        service = lab.get("com.docker.compose.service")
+        if not all(key) or not service:
+            unmanaged.append(d["container"])
+            continue
+        entry = groups.setdefault(key, {"services": [], "names": []})
+        if service not in entry["services"]:
+            entry["services"].append(service)
+        entry["names"].append(d["container"])
+    commands = []
+    for (project, workdir, files), entry in groups.items():
+        argv = ["docker", "compose", "--project-directory", workdir, "-p", project]
+        for f in files.split(","):
+            argv += ["-f", f]
+        commands.append((argv + ["up", "-d", "--force-recreate", "--no-deps"] + entry["services"], entry["names"]))
+    return commands, unmanaged
+
+
+def cmd_up(args):
+    cfgs = load_node_files(os.path.join(args.root, "nodes"))
+    vpn = [n for n, c in cfgs.items() if c.get("GLUETAIL_TYPE", "vpn") == "vpn"]
+    compose = ["docker", "compose", "up", "-d", "--remove-orphans"] + (["--force-recreate"] if args.force_recreate else [])
+    if args.dry_run:
+        before = snapshot_nodes(vpn)
+        print("would render docker-compose.yml, then run: " + " ".join(compose))
+        for node, info in before.items():
+            names = ", ".join(d["container"] for d in info["deps"]) or "none"
+            print(f"  node {node}: attached containers (recreated afterwards if the node is replaced): {names}")
+        return 0
+    cmd_render(args)
+    before = snapshot_nodes(vpn)
+    rc = subprocess.run(compose, cwd=args.root).returncode
+    if rc:
+        print(f"error: docker compose up failed (exit {rc}); attached containers were not touched", file=sys.stderr)
+        return rc
+    if args.no_dependents:
+        return 0
+    steps = plan_recreations(before, snapshot_nodes(vpn))
+    if not steps:
+        return 0
+    commands, unmanaged = recreate_commands(steps)
+    failed = []
+    for argv, names in commands:
+        print(f"recreating {', '.join(names)} (their VPN node was replaced)")
+        if subprocess.run(argv).returncode:
+            failed.append(names)
+    if unmanaged:
+        print(f"warning: not managed by compose, recreate by hand: {', '.join(unmanaged)}", file=sys.stderr)
+    if failed:
+        print(f"error: could not recreate: {', '.join(n for names in failed for n in names)}", file=sys.stderr)
+        return 1
+    return 1 if unmanaged else 0
 
 
 def cmd_render(args):
@@ -515,8 +654,10 @@ def _put_selection(node, values):
     return api(node, "PUT", "/v1/vpn/settings", {"provider": {"server_selection": values}})
 
 
-def _wait_running(node, timeout):
-    """Wait until the VPN is up and has a public IP; return the IP info or None."""
+def _wait_running(node, timeout, need_ip=True):
+    """Wait until the VPN is up; with need_ip also until gluetun reports a public IP.
+
+    Returns the IP info, {} when only 'running' could be confirmed (need_ip=False), or None on timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(2)
@@ -525,9 +666,19 @@ def _wait_running(node, timeout):
                 ip = api(node, "GET", "/v1/publicip/ip")
                 if ip.get("public_ip"):
                     return ip
+                if not need_ip:
+                    return {}
         except GluetailError:
             pass  # control API can blink while the VPN restarts
     return None
+
+
+def _can_verify(node):
+    """Whether gluetun's public-IP lookup works right now (it is our only proof the tunnel carries traffic)."""
+    try:
+        return bool(api(node, "GET", "/v1/publicip/ip").get("public_ip"))
+    except (GluetailError, AttributeError):
+        return False
 
 
 def _norm(value):
@@ -543,13 +694,16 @@ def set_filters(node, items, persist=True, timeout=90):
     if not after["match_count"]:
         raise GluetailError(f"no {after['plan']}-plan server matches that combination. "
                             + describe_failure(after, changes))
+    # If gluetun's lookup was already failing before the change, it cannot prove anything afterwards
+    # either: apply, wait for "running", and report the location as unverified instead of rolling back.
+    verify = _can_verify(node)
     result = _put_selection(node, changes)
     if result == "settings left unchanged":
         return {"node": node.name, "unchanged": True, "selection": new_sel}
-    ip = None if result == "crashed" else _wait_running(node, timeout)
+    ip = None if result == "crashed" else _wait_running(node, timeout, need_ip=verify)
     if ip is None:
         _put_selection(node, {k: selection[k] for k in changes})  # roll back to the saved selection
-        back = _wait_running(node, timeout)
+        back = _wait_running(node, timeout, need_ip=verify)
         raise GluetailError(f"{node.name}: the VPN did not come up with those filters; "
                             + ("rolled back to the previous selection" if back else
                                "rollback also pending (gluetun retries with growing delays), check `gluetail status`"))
@@ -560,8 +714,9 @@ def set_filters(node, items, persist=True, timeout=90):
                 continue  # unchanged: do not litter the node file with empty keys
             text = ",".join(value) if isinstance(value, list) else ("on" if value else "")
             update_env_file(node_file(node), by_key[key]["env"], text)
-    return {"node": node.name, "unchanged": False, "selection": new_sel, "public_ip": ip.get("public_ip"),
-            "country": ip.get("country"), "city": ip.get("city"), "persisted": persist}
+    return {"node": node.name, "unchanged": False, "selection": new_sel, "verified": bool(ip),
+            "public_ip": ip.get("public_ip"), "country": ip.get("country"), "city": ip.get("city"),
+            "persisted": persist}
 
 
 def node_from_files(root, data_dir, name):
@@ -603,12 +758,25 @@ SECURITY_HEADERS = {
 }
 
 
+MAX_BODY = 65536
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def host_without_port(value):
+    value = (value or "").strip().lower()
+    if value.startswith("["):  # [::1]:8421
+        return value[1:].split("]", 1)[0]
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
 class App:
     """Request handling for the web UI, kept free of sockets so it can be unit-tested."""
 
-    def __init__(self, root, data_dir, allowed_users=None):
+    def __init__(self, root, data_dir, allowed_users=None, allowed_hosts=None):
         self.root, self.data_dir = root, data_dir
         self.allowed_users = {u.strip().lower() for u in (allowed_users or []) if u.strip()}
+        # When set, only these Host header names (plus loopback) are served: stops DNS-rebinding pages.
+        self.allowed_hosts = {host_without_port(h) for h in (allowed_hosts or []) if h.strip()}
         self.web_dir = os.path.join(root, "web")
         self._locks = {}
 
@@ -619,6 +787,9 @@ class App:
     def handle(self, method, path, headers, body=b""):
         headers = {k.lower(): v for k, v in headers.items()}
         path = path.split("?", 1)[0]
+        if self.allowed_hosts and host_without_port(headers.get("host")) not in self.allowed_hosts | LOOPBACK_HOSTS:
+            print(f"rejected request for Host '{headers.get('host')}' (not in GLUETAIL_UI_HOSTS)", file=sys.stderr)
+            return self.respond(403, {"error": "host not allowed"})
         if self.allowed_users and headers.get("tailscale-user-login", "").lower() not in self.allowed_users:
             return self.respond(403, {"error": "not allowed"})
         try:
@@ -639,7 +810,8 @@ class App:
                 if method == "POST" and action in ("preview", "set"):
                     if not headers.get("content-type", "").startswith("application/json"):
                         return self.respond(415, {"error": "send application/json"})
-                    selection = json.loads(body or b"{}").get("selection")
+                    payload = json.loads(body or b"{}")
+                    selection = payload.get("selection") if isinstance(payload, dict) else None
                     if not isinstance(selection, dict):
                         raise GluetailError("body must be {\"selection\": {...}}")
                     return self.respond(200, self.preview(name, selection) if action == "preview"
@@ -695,19 +867,43 @@ class App:
 
 def make_handler(app):
     class Handler(BaseHTTPRequestHandler):
+        timeout = 15  # seconds per socket read, so a stalled client cannot pin a thread
+
+        def _reject(self, status, message):
+            payload = json.dumps({"error": message}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+            self.close_connection = True
+
         def _serve(self, method):
-            length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(min(length, 65536)) if length else b""
-            status, headers, payload = app.handle(method, self.path, dict(self.headers), body)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._reject(400, "invalid Content-Length")
+            if length < 0:
+                return self._reject(400, "invalid Content-Length")
+            if length > MAX_BODY:
+                return self._reject(413, "request too large")
+            body = self.rfile.read(length) if length else b""
+            status, headers, payload = app.handle("GET" if method == "HEAD" else method, self.path,
+                                                  dict(self.headers), body)
             self.send_response(status)
             for k, v in headers.items():
                 self.send_header(k, v)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(payload)
+            if method != "HEAD":
+                self.wfile.write(payload)
 
         def do_GET(self):
             self._serve("GET")
+
+        def do_HEAD(self):
+            self._serve("HEAD")
 
         def do_POST(self):
             self._serve("POST")
@@ -718,15 +914,34 @@ def make_handler(app):
     return Handler
 
 
+def is_loopback(address):
+    host = address.rsplit(":", 1)[0] if address.count(":") == 1 or address.startswith("[") else address
+    return host.strip("[]") in ("127.0.0.1", "localhost", "::1")
+
+
+def open_access_warning(users, published):
+    """Warn only when anyone who can reach the page is allowed and the port is not loopback-only."""
+    if users or is_loopback(published):
+        return None
+    return (f"warning: no user allowlist (GLUETAIL_UI_USERS) and the UI is published on {published}: anyone who "
+            "can reach it can change VPN settings. Put it behind tailscale serve or an authenticating proxy.")
+
+
 def cmd_serve(args):
     users = [u for u in (args.users or os.environ.get("GLUETAIL_UI_USERS", "")).split(",") if u.strip()]
-    app = App(args.root, args.data_dir, users)
-    if not users and args.bind not in ("127.0.0.1", "localhost", "::1"):
-        print("warning: no user allowlist (GLUETAIL_UI_USERS) and not bound to loopback: anyone who can reach "
-              "this port can change VPN settings. Put it behind tailscale serve or an authenticating proxy.",
-              file=sys.stderr)
+    hosts = [h for h in (args.hosts or os.environ.get("GLUETAIL_UI_HOSTS", "")).split(",") if h.strip()]
+    app = App(args.root, args.data_dir, users, hosts)
+    if users and not hosts:
+        print("note: GLUETAIL_UI_HOSTS is not set; set it to the name you reach the UI by (e.g. your "
+              "<host>.<tailnet>.ts.net) to also block DNS-rebinding requests.", file=sys.stderr)
+    # inside a container the bind is 0.0.0.0; the compose file tells us where it is published on the host
+    published = os.environ.get("GLUETAIL_UI_PUBLISHED") or args.bind
+    warning = open_access_warning(users, published)
+    if warning:
+        print(warning, file=sys.stderr)
     httpd = ThreadingHTTPServer((args.bind, args.port), make_handler(app))
-    print(f"gluetail UI on http://{args.bind}:{args.port} (nodes: {args.root}/nodes)", file=sys.stderr)
+    print(f"gluetail UI on http://{args.bind}:{args.port} (nodes: {args.root}/nodes; "
+          + (f"{len(users)} allowed login(s)" if users else "no login restriction") + ")", file=sys.stderr)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -764,7 +979,11 @@ def _print_set_result(res, args):
         print(f"{res['node']}: already set that way, nothing changed")
     else:
         note = f"saved to nodes/{res['node']}.env" if res["persisted"] else "not saved (reverts on recreate)"
-        print(f"{res['node']}: now exiting via {res['city']}, {res['country']} ({res['public_ip']}); {note}")
+        if res["verified"]:
+            print(f"{res['node']}: now exiting via {res['city']}, {res['country']} ({res['public_ip']}); {note}")
+        else:
+            print(f"{res['node']}: applied and the VPN is running, but the exit location could not be verified "
+                  f"(gluetun's public-IP lookup is not responding); {note}")
 
 
 def cmd_set(args):
@@ -815,7 +1034,14 @@ def main(argv=None):
     s.add_argument("--bind", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8421)
     s.add_argument("--users", help="comma-separated Tailscale logins allowed (default: $GLUETAIL_UI_USERS)")
+    s.add_argument("--hosts", help="comma-separated Host names to serve (default: $GLUETAIL_UI_HOSTS)")
     s.set_defaults(fn=cmd_serve)
+    s = sub.add_parser("up", help="render, `docker compose up -d`, then recreate containers attached to replaced nodes")
+    s.add_argument("--force-recreate", action="store_true", help="recreate every gluetail container")
+    s.add_argument("--no-dependents", action="store_true", help="do not recreate attached containers afterwards")
+    s.add_argument("--dry-run", action="store_true", help="show what would run, change nothing")
+    s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_up)
     s = sub.add_parser("render", help="generate docker-compose.yml from nodes/*.env")
     s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_render)
@@ -823,6 +1049,11 @@ def main(argv=None):
     s.add_argument("--json", action="store_true")
     s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_nodes)
+    s = sub.add_parser("dependents", help="list containers attached to a node's network namespace")
+    s.add_argument("node", nargs="?", help="node name or tailnet name (optional if there is one VPN node)")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_dependents)
     s = sub.add_parser("countries", help="list countries a node can use")
     s.add_argument("node", nargs="?", help="node name or tailnet name (optional if there is one VPN node)")
     s.add_argument("--root", default=SCRIPT_DIR, help=argparse.SUPPRESS)

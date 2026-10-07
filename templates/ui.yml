@@ -18,6 +18,8 @@
     command: ["python", "/app/gluetail", "serve", "--root", "/app", "--data-dir", "/data", "--bind", "0.0.0.0", "--port", "8421"]
     environment:
       - GLUETAIL_UI_USERS=${GLUETAIL_UI_USERS:-}
+      - GLUETAIL_UI_HOSTS=${GLUETAIL_UI_HOSTS:-}
+      - GLUETAIL_UI_PUBLISHED=${GLUETAIL_UI_BIND:-127.0.0.1:8421}
     ports:
       - "${GLUETAIL_UI_BIND:-127.0.0.1:8421}:8421"
     networks:

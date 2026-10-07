@@ -21,7 +21,7 @@ INSPECT = {
             "WIREGUARD_PRIVATE_KEY=SUPERSECRETKEY",
         ],
     },
-    "NetworkSettings": {"Networks": {"gluetail": {"IPAddress": "172.29.0.3"}}},
+    "NetworkSettings": {"Networks": {"gluetail": {"IPAddress": "172.18.0.3"}}},
     "Mounts": [{"Destination": "/gluetun", "Source": "/var/lib/gluetail/proton/gluetun"}],
 }
 
@@ -39,7 +39,7 @@ SERVERS = {
 class ParseNode(unittest.TestCase):
     def test_fields(self):
         n = g.parse_node(INSPECT)
-        self.assertEqual((n.name, n.state, n.host), ("proton", "running", "172.29.0.3"))
+        self.assertEqual((n.name, n.state, n.host), ("proton", "running", "172.18.0.3"))
         self.assertEqual((n.provider, n.free_only), ("protonvpn", True))
         self.assertEqual(n.working_dir, "/opt/gluetail")
         self.assertEqual(n.servers_json, "/var/lib/gluetail/proton/gluetun/servers.json")
@@ -129,6 +129,10 @@ class ParseEnvText(unittest.TestCase):
         with self.assertRaises(g.GluetailError):
             g.parse_env_text("not a pair")
 
+    def test_inline_comments_match_compose_semantics(self):
+        got = g.parse_env_text("A=1   # note\nB=\"x # kept\"\nC=http://h/#frag\nD=   # only a comment\nE=a#b\n")
+        self.assertEqual(got, {"A": "1", "B": "x # kept", "C": "http://h/#frag", "D": "", "E": "a#b"})
+
 
 class Render(unittest.TestCase):
     VPN = {"GLUETAIL_SECRETS": "/s/p.env", "VPN_SERVICE_PROVIDER": "protonvpn", "SERVER_COUNTRIES": "Japan"}
@@ -166,6 +170,44 @@ class Render(unittest.TestCase):
         for cfg in bad:
             with self.subTest(cfg=cfg), self.assertRaises(g.GluetailError):
                 g.render_compose({"n": cfg}, TEMPLATES)
+
+    def test_ports_are_published_on_the_vpn_container(self):
+        cfg = dict(self.VPN, GLUETAIL_PORTS="9080:8080, 127.0.0.1:9800:8000, 5000:5000/udp")
+        out = g.render_compose({"p": cfg}, TEMPLATES)
+        block = out.split("  gluetun-p:\n")[1].split("\n\n")[0]
+        self.assertIn('    ports:\n      - "9080:8080"\n      - "127.0.0.1:9800:8000"\n      - "5000:5000/udp"\n', block)
+        self.assertNotIn("@@", out)
+        self.assertNotIn("ports:", g.render_compose({"p": self.VPN}, TEMPLATES).split("  ui:")[0])
+
+    def test_bad_ports_are_rejected(self):
+        for bad in ("9080", "80:80:80:80", "0:80", "99999:80", "80:8080; rm -rf /", "a:b", "1.2.3:80:80"):
+            with self.subTest(bad=bad), self.assertRaises(g.GluetailError):
+                g.render_compose({"p": dict(self.VPN, GLUETAIL_PORTS=bad)}, TEMPLATES)
+
+    def test_ports_on_a_direct_node_are_rejected(self):
+        with self.assertRaises(g.GluetailError):
+            g.render_compose({"d": {"GLUETAIL_TYPE": "direct", "GLUETAIL_PORTS": "80:80"}}, TEMPLATES)
+
+    def test_shipped_example_files_render(self):
+        """The quick start copies nodes/*.env.example; every one of them must parse and render."""
+        nodes_dir = os.path.join(os.path.dirname(__file__), "..", "nodes")
+        examples = sorted(f for f in os.listdir(nodes_dir) if f.endswith(".env.example"))
+        self.assertTrue(examples)
+        for f in examples:
+            with self.subTest(example=f), open(os.path.join(nodes_dir, f)) as fh:
+                cfg = g.parse_env_text(fh.read())
+                out = g.render_compose({f[:-len(".env.example")]: cfg}, TEMPLATES)
+                self.assertNotIn("#", cfg.get("GLUETAIL_HOSTNAME", ""))
+                self.assertNotIn("#", cfg.get("GLUETAIL_SECRETS", ""))
+                self.assertIn("ts-" + f[:-len(".env.example")], out)
+
+    def test_control_api_port_may_only_be_published_on_loopback(self):
+        out = g.render_compose({"p": dict(self.VPN, GLUETAIL_PORTS="127.0.0.1:9800:8000")}, TEMPLATES)
+        self.assertIn('"127.0.0.1:9800:8000"', out)
+        for bad in ("9800:8000", "0.0.0.0:9800:8000", "192.0.2.9:9800:8000", "8000:8000/tcp"):
+            with self.subTest(bad=bad), self.assertRaises(g.GluetailError) as cm:
+                g.render_compose({"p": dict(self.VPN, GLUETAIL_PORTS=bad)}, TEMPLATES)
+            self.assertIn("control API", str(cm.exception))
 
     def test_no_nodes(self):
         with self.assertRaises(g.GluetailError):
@@ -330,6 +372,7 @@ class SetFilters(unittest.TestCase):
         self.current = {"countries": ["Japan"], "cities": [], "secure_core_only": False, "multi_hop_only": False}
         self.calls, self.writes = [], []
         self.put_reply = "running"
+        self.lookup_works = True  # whether gluetun's public-IP lookup returns an address
         patches = [
             mock.patch.object(g, "node_view", lambda n: (SCHEMA_SERVERS, self.facets, self.unsupported,
                                                          dict(self.current), True)),
@@ -346,7 +389,11 @@ class SetFilters(unittest.TestCase):
         self.calls.append((method, path, body))
         if method == "PUT":
             return self.put_reply
-        return {"status": "running"} if path.endswith("status") else {"public_ip": "9.9.9.9", "country": "Japan", "city": "Tokyo"}
+        if path.endswith("status"):
+            return {"status": "running"}
+        if not self.lookup_works:
+            return {"public_ip": ""}
+        return {"public_ip": "9.9.9.9", "country": "Japan", "city": "Tokyo"}
 
     def puts(self):
         return [c[2] for c in self.calls if c[0] == "PUT"]
@@ -378,6 +425,32 @@ class SetFilters(unittest.TestCase):
         self.put_reply = "settings left unchanged"
         self.assertTrue(g.set_filters(self.NODE, ["countries=Japan"])["unchanged"])
         self.assertEqual(self.writes, [])
+
+    def test_lookup_down_before_and_after_is_applied_unverified_without_rollback(self):
+        self.lookup_works = False
+        res = g.set_filters(self.NODE, ["countries=United States", "cities=Chicago"])
+        self.assertEqual(len(self.puts()), 1)  # no rollback
+        self.assertFalse(res["verified"])
+        self.assertEqual(self.writes, [("SERVER_COUNTRIES", "United States"), ("SERVER_CITIES", "Chicago")])
+
+    def test_lookup_that_breaks_only_after_the_change_is_rolled_back(self):
+        outer = self.fake_api
+        state = {"puts": 0}
+
+        def flaky(node, method, path, body=None, timeout=5):
+            if method == "PUT":
+                state["puts"] += 1
+                self.lookup_works = state["puts"] > 1  # works again only after the rollback PUT
+            return outer(node, method, path, body, timeout)
+
+        with mock.patch.object(g, "api", flaky), self.assertRaises(g.GluetailError) as cm:
+            g.set_filters(self.NODE, ["countries=United States"], timeout=4)
+        self.assertEqual(state["puts"], 2)
+        self.assertIn("rolled back", str(cm.exception))
+        self.assertEqual(self.writes, [])
+
+    def test_verified_result_flag(self):
+        self.assertTrue(g.set_filters(self.NODE, ["countries=United States"])["verified"])
 
     def test_flag_with_no_servers_explains_why(self):
         with self.assertRaises(g.GluetailError) as cm:
@@ -508,12 +581,218 @@ class WebApp(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertNotIn("secret", body.decode())
 
+    def test_host_allowlist_blocks_rebinding_but_keeps_loopback(self):
+        app = g.App(self.app.root, self.app.data_dir, None, ["ui.example.ts.net"])
+        ok = [{"Host": "ui.example.ts.net"}, {"Host": "UI.example.ts.net:8443"}, {"Host": "127.0.0.1:8421"},
+              {"Host": "localhost"}, {"Host": "[::1]:8421"}]
+        for headers in ok:
+            with self.subTest(headers=headers):
+                self.assertEqual(app.handle("GET", "/api/me", headers)[0], 200)
+        for host in ("evil.example.com", "evil.example.com:8421", "ui.example.ts.net.evil.com", "", "10.0.0.5:8421"):
+            with self.subTest(host=host):
+                self.assertEqual(app.handle("GET", "/api/me", {"Host": host})[0], 403)
+        self.assertEqual(app.handle("GET", "/api/me", {})[0], 403)  # no Host at all
+
+    def test_host_check_is_off_when_not_configured(self):
+        self.assertEqual(self.app.handle("GET", "/api/me", {"Host": "anything.example"})[0], 200)
+
+    def test_json_list_body_is_a_400_not_a_500(self):
+        status, _, _ = self.app.handle("POST", "/api/nodes/p/preview", {"Content-Type": "application/json"}, b"[1]")
+        self.assertEqual(status, 400)
+
     def test_allowlist(self):
         app = g.App(self.app.root, self.app.data_dir, ["me@example.com"])
         self.assertEqual(app.handle("GET", "/api/me", {})[0], 403)
         self.assertEqual(app.handle("GET", "/api/me", {"Tailscale-User-Login": "other@example.com"})[0], 403)
         status, _, body = app.handle("GET", "/api/me", {"tailscale-user-login": "ME@example.com"})
         self.assertEqual((status, json.loads(body)["user"]), (200, "ME@example.com"))
+
+
+class OpenAccessWarning(unittest.TestCase):
+    def test_quiet_when_loopback_or_restricted(self):
+        self.assertIsNone(g.open_access_warning([], "127.0.0.1:8421"))
+        self.assertIsNone(g.open_access_warning([], "localhost:8421"))
+        self.assertIsNone(g.open_access_warning([], "[::1]:8421"))
+        self.assertIsNone(g.open_access_warning(["me@x"], "0.0.0.0:8421"))
+
+    def test_warns_when_published_wide_without_allowlist(self):
+        for addr in ("0.0.0.0:8421", "100.64.0.7:8421", "192.0.2.5:80", "0.0.0.0"):
+            with self.subTest(addr=addr):
+                self.assertIn(addr, g.open_access_warning([], addr))
+
+
+class RealServer(unittest.TestCase):
+    """End-to-end over a real socket: HEAD must mirror GET, minus the body."""
+
+    def test_head_matches_get_without_body(self):
+        import http.client
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "web")); os.makedirs(os.path.join(root, "nodes"))
+            with open(os.path.join(root, "web", "index.html"), "w") as f:
+                f.write("<html>hi</html>")
+            httpd = g.ThreadingHTTPServer(("127.0.0.1", 0), g.make_handler(g.App(root, root)))
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            self.addCleanup(httpd.server_close); self.addCleanup(httpd.shutdown)
+            seen = {}
+            for method in ("GET", "HEAD"):
+                c = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+                c.request(method, "/")
+                r = c.getresponse()
+                seen[method] = (r.status, r.getheader("Content-Length"), r.getheader("Content-Security-Policy"), r.read())
+                c.close()
+            self.assertEqual(seen["GET"][:3], seen["HEAD"][:3])
+            self.assertEqual((seen["GET"][3], seen["HEAD"][3]), (b"<html>hi</html>", b""))
+
+
+class Dependents(unittest.TestCase):
+    NODE_ID = "ab" * 32
+
+    @staticmethod
+    def c(name, mode, state="running", service="svc"):
+        return {"Name": "/" + name, "State": {"Status": state}, "HostConfig": {"NetworkMode": mode},
+                "Config": {"Labels": {"com.docker.compose.project": "stack", "com.docker.compose.service": service}}}
+
+    def test_finds_by_id_and_name_ignores_others(self):
+        found = g.find_dependents([
+            self.c("app-b", "container:" + self.NODE_ID, service="app-b"),
+            self.c("app-a", "container:gluetail-gluetun-p", state="exited"),
+            self.c("short-id", "container:" + self.NODE_ID[:12]),
+            self.c("other-node", "container:" + "cd" * 32),
+            self.c("bridge", "bridge"),
+            self.c("service-mode", "service:gluetun"),
+        ], "gluetail-gluetun-p", self.NODE_ID)
+        self.assertEqual([d["container"] for d in found], ["app-a", "app-b", "short-id"])
+        self.assertEqual(found[1]["project"], "stack")
+
+    def test_short_unrelated_target_does_not_match(self):
+        self.assertEqual(g.find_dependents([self.c("x", "container:ab")], "n", self.NODE_ID), [])
+
+
+class RequestLimits(unittest.TestCase):
+    """Malformed requests must be refused cheaply, before any body is read or auth is evaluated."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        os.makedirs(os.path.join(tmp.name, "web")); os.makedirs(os.path.join(tmp.name, "nodes"))
+        self.httpd = g.ThreadingHTTPServer(("127.0.0.1", 0), g.make_handler(g.App(tmp.name, tmp.name)))
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close); self.addCleanup(self.httpd.shutdown)
+
+    def raw(self, request, timeout=5):
+        import socket
+        s = socket.create_connection(("127.0.0.1", self.httpd.server_address[1]), timeout=timeout)
+        self.addCleanup(s.close)
+        s.sendall(request)
+        return s.recv(4096).decode(errors="replace")
+
+    def test_negative_non_numeric_and_huge_content_length(self):
+        for value, expected in (("-1", "400"), ("abc", "400"), ("99999999", "413")):
+            with self.subTest(value=value):
+                reply = self.raw(f"POST /api/nodes/p/set HTTP/1.1\r\nHost: x\r\nContent-Length: {value}\r\n\r\n".encode())
+                self.assertIn(f" {expected} ", reply.split("\r\n")[0] + " ")
+
+    def test_handler_has_a_socket_timeout(self):
+        self.assertTrue(0 < g.make_handler(g.App("/x", "/x")).timeout <= 60)
+
+
+def dep(container, project="stack", service="svc", wd="/opt/stack", files="/opt/stack/compose.yml", managed=True):
+    labels = {"com.docker.compose.project": project, "com.docker.compose.service": service,
+              "com.docker.compose.project.working_dir": wd, "com.docker.compose.project.config_files": files} if managed else {}
+    return {"container": container, "state": "running", "project": project, "service": service, "labels": labels}
+
+
+class Up(unittest.TestCase):
+    def test_plan_only_for_replaced_nodes(self):
+        before = {"p": {"id": "A", "project": "gt", "deps": [dep("a"), dep("b")]},
+                  "q": {"id": "C", "project": "gt", "deps": [dep("c")]},
+                  "r": {"id": None, "project": None, "deps": []}}
+        after = {"p": {"id": "B"}, "q": {"id": "C"}, "r": {"id": "D"}}
+        self.assertEqual([(n, d["container"]) for n, d in g.plan_recreations(before, after)], [("p", "a"), ("p", "b")])
+        self.assertEqual(g.plan_recreations(before, {"p": {"id": "A"}, "q": {"id": "C"}, "r": {"id": None}}), [])
+
+    def test_commands_are_grouped_per_compose_project(self):
+        steps = [("p", dep("app-a", service="app-a")), ("p", dep("app-b", service="app-b")),
+                 ("p", dep("other", project="other", service="x", wd="/opt/o", files="/opt/o/a.yml,/opt/o/b.yml"))]
+        commands, unmanaged = g.recreate_commands(steps)
+        self.assertEqual(unmanaged, [])
+        self.assertEqual(commands[0][0], ["docker", "compose", "--project-directory", "/opt/stack", "-p", "stack",
+                                          "-f", "/opt/stack/compose.yml", "up", "-d", "--force-recreate", "--no-deps",
+                                          "app-a", "app-b"])
+        self.assertEqual(commands[1][0], ["docker", "compose", "--project-directory", "/opt/o", "-p", "other",
+                                          "-f", "/opt/o/a.yml", "-f", "/opt/o/b.yml",
+                                          "up", "-d", "--force-recreate", "--no-deps", "x"])
+        self.assertEqual([names for _, names in commands], [["app-a", "app-b"], ["other"]])
+
+    def test_containers_without_compose_labels_are_reported(self):
+        commands, unmanaged = g.recreate_commands([("p", dep("manual", managed=False))])
+        self.assertEqual((commands, unmanaged), ([], ["manual"]))
+
+    # -- orchestration with the docker side mocked
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.makedirs(os.path.join(self.tmp.name, "nodes"))
+        with open(os.path.join(self.tmp.name, "nodes", "p.env"), "w") as f:
+            f.write("VPN_SERVICE_PROVIDER=prov\n")
+        os.makedirs(os.path.join(self.tmp.name, "templates"))
+        for name in ("header.yml", "vpn.yml", "ui.yml", "direct.yml"):
+            with open(os.path.join(TEMPLATES, name)) as src, open(os.path.join(self.tmp.name, "templates", name), "w") as dst:
+                dst.write(src.read())
+        self.runs = []
+        self.snaps = []
+        self.rc = {}
+        patches = [mock.patch.object(g, "snapshot_nodes", lambda names: self.snaps.pop(0)),
+                   mock.patch.object(g.subprocess, "run", self.fake_run)]
+        for p in patches:
+            p.start(); self.addCleanup(p.stop)
+        self.args = g.argparse.Namespace(root=self.tmp.name, force_recreate=False, no_dependents=False, dry_run=False)
+
+    def fake_run(self, argv, **kw):
+        self.runs.append(argv)
+        return mock.Mock(returncode=self.rc.get(argv[-1] if argv[2] != "--project-directory" else "recreate", 0))
+
+    def test_replaced_node_triggers_recreation_after_compose_up(self):
+        self.snaps = [{"p": {"id": "A", "project": "gt", "deps": [dep("app-a", service="app-a")]}}, {"p": {"id": "B"}}]
+        self.assertEqual(g.cmd_up(self.args), 0)
+        self.assertEqual(self.runs[0][:5], ["docker", "compose", "up", "-d", "--remove-orphans"])
+        self.assertIn("--force-recreate", self.runs[1])
+        self.assertEqual(self.runs[1][-1], "app-a")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "docker-compose.yml")))
+
+    def test_unchanged_node_recreates_nothing(self):
+        self.snaps = [{"p": {"id": "A", "project": "gt", "deps": [dep("app-a")]}}, {"p": {"id": "A"}}]
+        self.assertEqual(g.cmd_up(self.args), 0)
+        self.assertEqual(len(self.runs), 1)
+
+    def test_compose_failure_leaves_dependents_alone(self):
+        self.snaps = [{"p": {"id": "A", "project": "gt", "deps": [dep("app-a")]}}]
+        self.rc["--remove-orphans"] = 3
+        self.assertEqual(g.cmd_up(self.args), 3)
+        self.assertEqual(len(self.runs), 1)
+
+    def test_no_dependents_flag(self):
+        self.args.no_dependents = True
+        self.snaps = [{"p": {"id": "A", "project": "gt", "deps": [dep("app-a")]}}]
+        self.assertEqual(g.cmd_up(self.args), 0)
+        self.assertEqual(len(self.runs), 1)
+
+    def test_force_recreate_flag_is_passed_to_compose(self):
+        self.args.force_recreate = True
+        self.snaps = [{"p": {"id": "A", "project": "gt", "deps": []}}, {"p": {"id": "A"}}]
+        g.cmd_up(self.args)
+        self.assertIn("--force-recreate", self.runs[0])
+
+    def test_dry_run_changes_nothing(self):
+        self.args.dry_run = True
+        self.snaps = [{"p": {"id": "A", "project": "gt", "deps": [dep("app-a")]}}]
+        self.assertEqual(g.cmd_up(self.args), 0)
+        self.assertEqual(self.runs, [])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "docker-compose.yml")))
+
+    def test_unmanaged_dependent_makes_the_command_report_failure(self):
+        self.snaps = [{"p": {"id": "A", "project": "gt", "deps": [dep("manual", managed=False)]}}, {"p": {"id": "B"}}]
+        self.assertEqual(g.cmd_up(self.args), 1)
 
 
 class SelectionItems(unittest.TestCase):

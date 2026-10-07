@@ -1,0 +1,23 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: python3 -I -W error -m unittest discover -s tests
+      - name: Quick start from the shipped examples renders valid compose
+        run: |
+          cp nodes/direct.env.example nodes/direct.env
+          cp nodes/proton.env.example nodes/proton.env
+          cp .env.example .env
+          mkdir -p secrets
+          echo TS_AUTHKEY=dummy > secrets/tailscale.env
+          echo WIREGUARD_PRIVATE_KEY=dummy > secrets/proton.env
+          echo COMPOSE_PROFILES=direct,proton,ui >> .env
+          ./gluetail render
+          docker compose config -q

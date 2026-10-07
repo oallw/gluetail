@@ -8,6 +8,7 @@
     container_name: gluetail-gluetun-@@NAME@@
     labels:
       - gluetail.node=@@NAME@@
+@@PORTS@@
     env_file:
       - @@SECRETS@@
       - nodes/@@NAME@@.env

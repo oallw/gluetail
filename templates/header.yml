@@ -10,7 +10,7 @@ networks:
     name: gluetail
 
 x-tailscale-exit: &tailscale-exit
-  image: tailscale/tailscale:${TAILSCALE_TAG:-stable}
+  image: tailscale/tailscale:${TAILSCALE_TAG:-v1.102.5}
   restart: unless-stopped
   env_file:
     - ${GLUETAIL_TS_ENV:-./secrets/tailscale.env}
@@ -20,7 +20,9 @@ x-tailscale-exit: &tailscale-exit
     - /dev/net/tun:/dev/net/tun
 
 x-gluetun: &gluetun
-  image: qmcgaw/gluetun:${GLUETUN_TAG:-latest}
+  # Pinned by digest to the build this project was developed and tested with (a gluetun main-branch
+  # build, commit 628b0a2, 2026-04-22). Bump deliberately and re-test country switching.
+  image: ${GLUETUN_IMAGE:-qmcgaw/gluetun@sha256:725d3e51091dde4ca43e3e3f26e2e6d3d0ccc66821e92d505c3da04958f7d472}
   restart: unless-stopped
   cap_add:
     - NET_ADMIN

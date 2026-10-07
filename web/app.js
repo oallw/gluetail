@@ -78,8 +78,9 @@ function vpnCard(info) {
     render();
     try {
       const res = await api(`/api/nodes/${encodeURIComponent(info.node)}/set`, { selection: state.sel });
-      state.message = { ok: true, text: res.unchanged ? "Already set that way." :
-        `Now exiting via ${res.city || "?"}, ${res.country || "?"}.` };
+      state.message = res.unchanged ? { ok: true, text: "Already set that way." } :
+        res.verified === false ? { text: "Applied, VPN is running. Exit location could not be verified (gluetun's IP lookup is not responding)." } :
+        { ok: true, text: `Now exiting via ${res.city || "?"}, ${res.country || "?"}.` };
       Object.assign(info, await statusFor(info.node));
       await load();
     } catch (e) {

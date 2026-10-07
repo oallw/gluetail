@@ -1,12 +1,11 @@
-# Control-server access for gluetail. The control server is only reachable on the
-# private "gluetail" Docker network (no host ports are published), so "none" is
-# acceptable here; switch to "apikey" if you expose it elsewhere.
+# Control-server access for gluetail. Anyone who can reach gluetun's port 8000 (containers on the
+# "gluetail" network, containers attached to a node, processes on the host via the bridge) gets
+# these routes with no credentials, so never publish port 8000 beyond loopback (gluetail refuses to).
 # Do NOT allow "GET /v1/vpn/settings": its response includes the WireGuard private key.
 [[roles]]
 name = "gluetail"
 routes = [
   "GET /v1/vpn/status",
-  "PUT /v1/vpn/status",
   "PUT /v1/vpn/settings",
   "GET /v1/publicip/ip",
 ]
