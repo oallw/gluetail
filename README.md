@@ -82,7 +82,10 @@ SERVER_COUNTRIES=Netherlands
 - [Troubleshooting](docs/troubleshooting.md): implementation notes and known issues
 - [SECURITY.md](SECURITY.md)
 
-## Disclaimer
+## License
+
+MIT, see [LICENSE](LICENSE). The bundled JetBrains Mono font in `web/fonts/` is under the SIL Open Font
+License 1.1 (`web/fonts/OFL.txt`).
 
 gluetail is an independent project, not affiliated with or endorsed by Tailscale Inc., the gluetun project,
 Proton AG, Mullvad VPN AB or JetBrains. Using a VPN provider through it is subject to that provider's terms.
